@@ -17,11 +17,7 @@ package com.android.browser.search;
 
 import com.android.browser.R;
 
-import android.app.SearchManager;
-import android.content.ComponentName;
 import android.content.Context;
-import android.content.pm.ActivityInfo;
-import android.content.pm.PackageManager;
 import android.content.res.Resources;
 import android.text.TextUtils;
 import android.util.Log;
@@ -61,7 +57,7 @@ public class SearchEngines {
         return new OpenSearchSearchEngine(context, searchEngineInfo);
     }
 
-    private static SearchEngineInfo getSearchEngineInfo(Context context, String name) {
+    public static SearchEngineInfo getSearchEngineInfo(Context context, String name) {
         try {
             return new SearchEngineInfo(context, name);
         } catch (IllegalArgumentException exception) {

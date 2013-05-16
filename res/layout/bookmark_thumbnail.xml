@@ -14,66 +14,50 @@
      limitations under the License.
 -->
 
-<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    android:layout_width="match_parent"
-    android:layout_height="match_parent"
+<com.android.browser.view.BookmarkContainer xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
     android:orientation="vertical"
-    android:padding="0dip"
+    android:padding="@dimen/combo_horizontalSpacing"
+    android:background="@drawable/bookmark_thumb_selector"
     >
 
-    <ImageView android:id="@+id/thumb"
+    <ImageView
+        android:id="@+id/thumb"
         android:src="@drawable/browser_thumbnail"
-        android:scaleType="center"
-        android:layout_height="wrap_content"
-        android:layout_width="wrap_content"
-        android:layout_gravity="center"
+        android:scaleType="centerCrop"
+        android:layout_height="@dimen/bookmarkThumbnailHeight"
+        android:layout_width="@dimen/bookmarkThumbnailWidth"
+        android:layout_centerHorizontal="true"
+        android:background="@drawable/border_thumb_bookmarks_widget_holo"
         />
 
-    <!-- FIXME: Want to have a gradient over the thumb -->
-
-    <!-- This holds the star for addbookmark -->
-    <LinearLayout android:id="@+id/holder"
-        android:layout_height="match_parent"
-        android:layout_width="match_parent"
-        android:orientation="horizontal"
-        android:background="#99000000"
-        android:gravity="center"
-        android:layout_alignBottom="@+id/thumb"
-        android:layout_alignTop="@+id/thumb"
-        >
-        <ImageView
-            android:layout_height="wrap_content"
-            android:layout_width="wrap_content"
-            android:src="@drawable/ic_list_bookmark"
-            />
-        <TextView
-            android:layout_height="wrap_content"
-            android:layout_width="wrap_content"
-            android:textAppearance="?android:attr/textAppearanceSmall"
-            android:textStyle="bold"
-            android:textColor="@color/white"
-            android:text="@string/add_bookmark_short"
-            />
-    </LinearLayout>
+    <ImageView
+        android:id="@+id/divider"
+        android:src="?android:attr/dividerVertical"
+        android:layout_width="wrap_content"
+        android:layout_height="24dip"
+        android:layout_below="@+id/thumb"
+        android:layout_alignLeft="@+id/thumb"
+        android:scaleType="fitXY"
+        android:layout_marginTop="12dip"
+        />
 
     <TextView android:id="@+id/label"
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_gravity="bottom"
-        android:textAppearance="?android:attr/textAppearanceSmall"
-        android:textStyle="bold"
-        android:textColor="@color/white"
-        android:maxLines="1"
-        android:paddingLeft="2dip"
-        android:paddingRight="2dip"
-        android:paddingTop="0dip"
-        android:paddingBottom="0dip"
-        android:layout_marginTop="0dip"
-        android:scrollHorizontally="true"
-        android:ellipsize="marquee"
-        android:layout_below="@+id/thumb"
-        android:layout_alignLeft="@+id/thumb"
+        android:layout_height="match_parent"
+        android:layout_toRightOf="@id/divider"
+        android:layout_alignTop="@id/divider"
+        android:layout_alignBottom="@id/divider"
         android:layout_alignRight="@+id/thumb"
+        android:paddingLeft="8dip"
+        android:paddingRight="2dip"
+        android:gravity="center_vertical"
+        android:singleLine="true"
+        android:ellipsize="marquee"
+        android:typeface="sans"
+        android:textSize="14sp"
+        android:textColor="#AAAAAA"
         />
 
-</RelativeLayout>
+</com.android.browser.view.BookmarkContainer>

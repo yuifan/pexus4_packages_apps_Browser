@@ -20,21 +20,26 @@ import android.content.ContentResolver;
 import android.content.ContentUris;
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.SharedPreferences;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.net.Uri;
-import android.provider.Browser;
+import android.os.AsyncTask;
+import android.preference.PreferenceManager;
+import android.provider.BrowserContract;
+import android.provider.BrowserContract.Combined;
+import android.provider.BrowserContract.Images;
+import android.text.TextUtils;
 import android.util.Log;
 import android.webkit.WebIconDatabase;
 import android.widget.Toast;
 
 import java.io.ByteArrayOutputStream;
-import java.util.Date;
 
 /**
  *  This class is purely to have a common place for adding/deleting bookmarks.
  */
-/* package */ class Bookmarks {
+public class Bookmarks {
     // We only want the user to be able to bookmark content that
     // the browser can handle directly.
     private static final String acceptableBookmarkSchemes[] = {
@@ -53,89 +58,31 @@ import java.util.Date;
      *  @param context Context of the calling Activity.  This is used to make
      *          Toast confirming that the bookmark has been added.  If the
      *          caller provides null, the Toast will not be shown.
-     *  @param cr The ContentResolver being used to add the bookmark to the db.
      *  @param url URL of the website to be bookmarked.
      *  @param name Provided name for the bookmark.
      *  @param thumbnail A thumbnail for the bookmark.
      *  @param retainIcon Whether to retain the page's icon in the icon database.
      *          This will usually be <code>true</code> except when bookmarks are
      *          added by a settings restore agent.
+     *  @param parent ID of the parent folder.
      */
-    /* package */ static void addBookmark(Context context,
-            ContentResolver cr, String url, String name,
-            Bitmap thumbnail, boolean retainIcon) {
+    /* package */ static void addBookmark(Context context, boolean showToast, String url,
+            String name, Bitmap thumbnail, long parent) {
         // Want to append to the beginning of the list
-        long creationTime = new Date().getTime();
-        ContentValues map = new ContentValues();
-        Cursor cursor = null;
+        ContentValues values = new ContentValues();
         try {
-            cursor = Browser.getVisitedLike(cr, url);
-            if (cursor.moveToFirst() && cursor.getInt(
-                    Browser.HISTORY_PROJECTION_BOOKMARK_INDEX) == 0) {
-                // This means we have been to this site but not bookmarked
-                // it, so convert the history item to a bookmark
-                map.put(Browser.BookmarkColumns.CREATED, creationTime);
-                map.put(Browser.BookmarkColumns.TITLE, name);
-                map.put(Browser.BookmarkColumns.BOOKMARK, 1);
-                map.put(Browser.BookmarkColumns.THUMBNAIL,
-                        bitmapToBytes(thumbnail));
-                cr.update(Browser.BOOKMARKS_URI, map,
-                        "_id = " + cursor.getInt(0), null);
-            } else {
-                int count = cursor.getCount();
-                boolean matchedTitle = false;
-                for (int i = 0; i < count; i++) {
-                    // One or more bookmarks already exist for this site.
-                    // Check the names of each
-                    cursor.moveToPosition(i);
-                    if (cursor.getString(Browser.HISTORY_PROJECTION_TITLE_INDEX)
-                            .equals(name)) {
-                        // The old bookmark has the same name.
-                        // Update its creation time.
-                        map.put(Browser.BookmarkColumns.CREATED,
-                                creationTime);
-                        cr.update(Browser.BOOKMARKS_URI, map,
-                                "_id = " + cursor.getInt(0), null);
-                        matchedTitle = true;
-                        break;
-                    }
-                }
-                if (!matchedTitle) {
-                    // Adding a bookmark for a site the user has visited,
-                    // or a new bookmark (with a different name) for a site
-                    // the user has visited
-                    map.put(Browser.BookmarkColumns.TITLE, name);
-                    map.put(Browser.BookmarkColumns.URL, url);
-                    map.put(Browser.BookmarkColumns.CREATED, creationTime);
-                    map.put(Browser.BookmarkColumns.BOOKMARK, 1);
-                    map.put(Browser.BookmarkColumns.DATE, 0);
-                    map.put(Browser.BookmarkColumns.THUMBNAIL,
-                            bitmapToBytes(thumbnail));
-                    int visits = 0;
-                    if (count > 0) {
-                        // The user has already bookmarked, and possibly
-                        // visited this site.  However, they are creating
-                        // a new bookmark with the same url but a different
-                        // name.  The new bookmark should have the same
-                        // number of visits as the already created bookmark.
-                        visits = cursor.getInt(
-                                Browser.HISTORY_PROJECTION_VISITS_INDEX);
-                    }
-                    // Bookmark starts with 3 extra visits so that it will
-                    // bubble up in the most visited and goto search box
-                    map.put(Browser.BookmarkColumns.VISITS, visits + 3);
-                    cr.insert(Browser.BOOKMARKS_URI, map);
-                }
-            }
+            SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(context);
+            values.put(BrowserContract.Bookmarks.TITLE, name);
+            values.put(BrowserContract.Bookmarks.URL, url);
+            values.put(BrowserContract.Bookmarks.IS_FOLDER, 0);
+            values.put(BrowserContract.Bookmarks.THUMBNAIL,
+                    bitmapToBytes(thumbnail));
+            values.put(BrowserContract.Bookmarks.PARENT, parent);
+            context.getContentResolver().insert(BrowserContract.Bookmarks.CONTENT_URI, values);
         } catch (IllegalStateException e) {
             Log.e(LOGTAG, "addBookmark", e);
-        } finally {
-            if (cursor != null) cursor.close();
         }
-        if (retainIcon) {
-            WebIconDatabase.getInstance().retainIconForPageUrl(url);
-        }
-        if (context != null) {
+        if (showToast) {
             Toast.makeText(context, R.string.added_to_bookmarks,
                     Toast.LENGTH_LONG).show();
         }
@@ -146,8 +93,8 @@ import java.util.Date;
      *  will remain in the database, but only as a history item, and not as a
      *  bookmarked site.
      *  @param context Context of the calling Activity.  This is used to make
-     *          Toast confirming that the bookmark has been removed.  If the
-     *          caller provides null, the Toast will not be shown.
+     *          Toast confirming that the bookmark has been removed and to
+     *          lookup the correct content uri.  It must not be null.
      *  @param cr The ContentResolver being used to remove the bookmark.
      *  @param url URL of the website to be removed.
      */
@@ -155,37 +102,23 @@ import java.util.Date;
             ContentResolver cr, String url, String title) {
         Cursor cursor = null;
         try {
-            cursor = cr.query(
-                    Browser.BOOKMARKS_URI,
-                    Browser.HISTORY_PROJECTION,
-                    "url = ? AND title = ?",
+            Uri uri = BookmarkUtils.getBookmarksUri(context);
+            cursor = cr.query(uri,
+                    new String[] { BrowserContract.Bookmarks._ID },
+                    BrowserContract.Bookmarks.URL + " = ? AND " +
+                            BrowserContract.Bookmarks.TITLE + " = ?",
                     new String[] { url, title },
                     null);
-            boolean first = cursor.moveToFirst();
-            // Should be in the database no matter what
-            if (!first) {
-                throw new AssertionError("URL is not in the database! " + url
-                        + " " + title);
+
+            if (!cursor.moveToFirst()) {
+                return;
             }
+
             // Remove from bookmarks
             WebIconDatabase.getInstance().releaseIconForPageUrl(url);
-            Uri uri = ContentUris.withAppendedId(Browser.BOOKMARKS_URI,
-                    cursor.getInt(Browser.HISTORY_PROJECTION_ID_INDEX));
-            int numVisits = cursor.getInt(
-                    Browser.HISTORY_PROJECTION_VISITS_INDEX);
-            if (0 == numVisits) {
-                cr.delete(uri, null, null);
-            } else {
-                // It is no longer a bookmark, but it is still a visited
-                // site.
-                ContentValues values = new ContentValues();
-                values.put(Browser.BookmarkColumns.BOOKMARK, 0);
-                try {
-                    cr.update(uri, values, null, null);
-                } catch (IllegalStateException e) {
-                    Log.e("removeFromBookmarks", "no database!");
-                }
-            }
+            uri = ContentUris.withAppendedId(BrowserContract.Bookmarks.CONTENT_URI,
+                    cursor.getLong(0));
+            cr.delete(uri, null, null);
             if (context != null) {
                 Toast.makeText(context, R.string.removed_from_bookmarks,
                         Toast.LENGTH_LONG).show();
@@ -218,5 +151,76 @@ import java.util.Date;
             }
         }
         return false;
+    }
+
+    static final String QUERY_BOOKMARKS_WHERE =
+            Combined.URL + " == ? OR " +
+            Combined.URL + " == ?";
+
+    public static Cursor queryCombinedForUrl(ContentResolver cr,
+            String originalUrl, String url) {
+        if (cr == null || url == null) {
+            return null;
+        }
+    
+        // If originalUrl is null, just set it to url.
+        if (originalUrl == null) {
+            originalUrl = url;
+        }
+    
+        // Look for both the original url and the actual url. This takes in to
+        // account redirects.
+    
+        final String[] selArgs = new String[] { originalUrl, url };
+        final String[] projection = new String[] { Combined.URL };
+        return cr.query(Combined.CONTENT_URI, projection, QUERY_BOOKMARKS_WHERE, selArgs, null);
+    }
+
+    // Strip the query from the given url.
+    static String removeQuery(String url) {
+        if (url == null) {
+            return null;
+        }
+        int query = url.indexOf('?');
+        String noQuery = url;
+        if (query != -1) {
+            noQuery = url.substring(0, query);
+        }
+        return noQuery;
+    }
+
+    /**
+     * Update the bookmark's favicon. This is a convenience method for updating
+     * a bookmark favicon for the originalUrl and url of the passed in WebView.
+     * @param cr The ContentResolver to use.
+     * @param originalUrl The original url before any redirects.
+     * @param url The current url.
+     * @param favicon The favicon bitmap to write to the db.
+     */
+    /* package */ static void updateFavicon(final ContentResolver cr,
+            final String originalUrl, final String url, final Bitmap favicon) {
+        new AsyncTask<Void, Void, Void>() {
+            @Override
+            protected Void doInBackground(Void... unused) {
+                final ByteArrayOutputStream os = new ByteArrayOutputStream();
+                favicon.compress(Bitmap.CompressFormat.PNG, 100, os);
+
+                // The Images update will insert if it doesn't exist
+                ContentValues values = new ContentValues();
+                values.put(Images.FAVICON, os.toByteArray());
+                updateImages(cr, originalUrl, values);
+                updateImages(cr, url, values);
+                return null;
+            }
+
+            private void updateImages(final ContentResolver cr,
+                    final String url, ContentValues values) {
+                String iurl = removeQuery(url);
+                if (!TextUtils.isEmpty(iurl)) {
+                    values.put(Images.URL, iurl);
+                    cr.update(BrowserContract.Images.CONTENT_URI, values, null, null);
+                }
+            }
+        }.execute();
     }
 }

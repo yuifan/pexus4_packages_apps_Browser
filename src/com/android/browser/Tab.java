@@ -16,44 +16,39 @@
 
 package com.android.browser;
 
-import java.io.File;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.LinkedList;
-import java.util.Map;
-import java.util.Vector;
-
+import android.app.Activity;
 import android.app.AlertDialog;
-import android.app.SearchManager;
 import android.content.ContentResolver;
 import android.content.ContentValues;
+import android.content.Context;
 import android.content.DialogInterface;
 import android.content.DialogInterface.OnCancelListener;
-import android.content.Intent;
-import android.database.Cursor;
-import android.database.sqlite.SQLiteDatabase;
-import android.database.sqlite.SQLiteException;
 import android.graphics.Bitmap;
+import android.graphics.Bitmap.CompressFormat;
+import android.graphics.BitmapFactory;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.Picture;
+import android.graphics.PorterDuff;
+import android.graphics.PorterDuffXfermode;
 import android.net.Uri;
 import android.net.http.SslError;
-import android.os.AsyncTask;
 import android.os.Bundle;
+import android.os.Handler;
 import android.os.Message;
 import android.os.SystemClock;
-import android.provider.Browser;
-import android.speech.RecognizerResultsIntent;
+import android.security.KeyChain;
+import android.security.KeyChainAliasCallback;
 import android.text.TextUtils;
 import android.util.Log;
 import android.view.KeyEvent;
 import android.view.LayoutInflater;
 import android.view.View;
-import android.view.ViewGroup;
 import android.view.ViewStub;
-import android.view.View.OnClickListener;
+import android.webkit.BrowserDownloadListener;
+import android.webkit.ClientCertRequestHandler;
 import android.webkit.ConsoleMessage;
-import android.webkit.CookieSyncManager;
-import android.webkit.DownloadListener;
 import android.webkit.GeolocationPermissions;
 import android.webkit.HttpAuthHandler;
 import android.webkit.SslErrorHandler;
@@ -63,32 +58,83 @@ import android.webkit.WebBackForwardList;
 import android.webkit.WebBackForwardListClient;
 import android.webkit.WebChromeClient;
 import android.webkit.WebHistoryItem;
-import android.webkit.WebIconDatabase;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebStorage;
 import android.webkit.WebView;
+import android.webkit.WebView.PictureListener;
+import android.webkit.WebViewClassic;
 import android.webkit.WebViewClient;
-import android.widget.FrameLayout;
-import android.widget.ImageButton;
-import android.widget.LinearLayout;
-import android.widget.TextView;
+import android.webkit.WebViewClientClassicExt;
+import android.widget.CheckBox;
+import android.widget.Toast;
 
-import com.android.common.speech.LoggingEvents;
+import com.android.browser.TabControl.OnThumbnailUpdatedListener;
+import com.android.browser.homepages.HomeProvider;
+import com.android.browser.provider.SnapshotProvider.Snapshots;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.util.LinkedList;
+import java.util.Map;
+import java.util.UUID;
+import java.util.Vector;
+import java.util.regex.Pattern;
+import java.util.zip.GZIPOutputStream;
 
 /**
  * Class for maintaining Tabs with a main WebView and a subwindow.
  */
-class Tab {
+class Tab implements PictureListener {
+
     // Log Tag
     private static final String LOGTAG = "Tab";
+    private static final boolean LOGD_ENABLED = com.android.browser.Browser.LOGD_ENABLED;
     // Special case the logtag for messages for the Console to make it easier to
     // filter them and match the logtag used for these messages in older versions
     // of the browser.
     private static final String CONSOLE_LOGTAG = "browser";
 
+    private static final int MSG_CAPTURE = 42;
+    private static final int CAPTURE_DELAY = 100;
+    private static final int INITIAL_PROGRESS = 5;
+
+    private static Bitmap sDefaultFavicon;
+
+    private static Paint sAlphaPaint = new Paint();
+    static {
+        sAlphaPaint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.CLEAR));
+        sAlphaPaint.setColor(Color.TRANSPARENT);
+    }
+
+    public enum SecurityState {
+        // The page's main resource does not use SSL. Note that we use this
+        // state irrespective of the SSL authentication state of sub-resources.
+        SECURITY_STATE_NOT_SECURE,
+        // The page's main resource uses SSL and the certificate is good. The
+        // same is true of all sub-resources.
+        SECURITY_STATE_SECURE,
+        // The page's main resource uses SSL and the certificate is good, but
+        // some sub-resources either do not use SSL or have problems with their
+        // certificates.
+        SECURITY_STATE_MIXED,
+        // The page's main resource uses SSL but there is a problem with its
+        // certificate.
+        SECURITY_STATE_BAD_CERTIFICATE,
+    }
+
+    Context mContext;
+    protected WebViewController mWebViewController;
+
+    // The tab ID
+    private long mId = -1;
+
     // The Geolocation permissions prompt
     private GeolocationPermissionsPrompt mGeolocationPermissionsPrompt;
     // Main WebView wrapper
-    private LinearLayout mContainer;
+    private View mContainer;
     // Main WebView
     private WebView mMainView;
     // Subwindow container
@@ -99,288 +145,112 @@ class Tab {
     // information needed to restore the WebView if the user goes back to the
     // tab.
     private Bundle mSavedState;
-    // Data used when displaying the tab in the picker.
-    private PickerData mPickerData;
     // Parent Tab. This is the Tab that created this Tab, or null if the Tab was
     // created by the UI
-    private Tab mParentTab;
+    private Tab mParent;
     // Tab that constructed by this Tab. This is used when this Tab is
     // destroyed, it clears all mParentTab values in the children.
-    private Vector<Tab> mChildTabs;
-    // If true, the tab will be removed when back out of the first page.
-    private boolean mCloseOnExit;
+    private Vector<Tab> mChildren;
     // If true, the tab is in the foreground of the current activity.
     private boolean mInForeground;
-    // If true, the tab is in loading state.
-    private boolean mInLoad;
+    // If true, the tab is in page loading state (after onPageStarted,
+    // before onPageFinsihed)
+    private boolean mInPageLoad;
+    private boolean mDisableOverrideUrlLoading;
+    // The last reported progress of the current page
+    private int mPageLoadProgress;
     // The time the load started, used to find load page time
     private long mLoadStartTime;
     // Application identifier used to find tabs that another application wants
     // to reuse.
     private String mAppId;
+    // flag to indicate if tab should be closed on back
+    private boolean mCloseOnBack;
     // Keep the original url around to avoid killing the old WebView if the url
     // has not changed.
-    private String mOriginalUrl;
     // Error console for the tab
     private ErrorConsoleView mErrorConsole;
-    // the lock icon type and previous lock icon type for the tab
-    private int mLockIconType;
-    private int mPrevLockIconType;
-    // Inflation service for making subwindows.
-    private final LayoutInflater mInflateService;
-    // The BrowserActivity which owners the Tab
-    private final BrowserActivity mActivity;
     // The listener that gets invoked when a download is started from the
     // mMainView
-    private final DownloadListener mDownloadListener;
+    private final BrowserDownloadListener mDownloadListener;
     // Listener used to know when we move forward or back in the history list.
     private final WebBackForwardListClient mWebBackForwardListClient;
+    private DataController mDataController;
+    // State of the auto-login request.
+    private DeviceAccountLogin mDeviceAccountLogin;
 
     // AsyncTask for downloading touch icons
     DownloadTouchIcon mTouchIconLoader;
 
-    // Extra saved information for displaying the tab in the picker.
-    private static class PickerData {
-        String  mUrl;
-        String  mTitle;
-        Bitmap  mFavicon;
+    private BrowserSettings mSettings;
+    private int mCaptureWidth;
+    private int mCaptureHeight;
+    private Bitmap mCapture;
+    private Handler mHandler;
+    private boolean mUpdateThumbnail;
+
+    /**
+     * See {@link #clearBackStackWhenItemAdded(String)}.
+     */
+    private Pattern mClearHistoryUrlPattern;
+
+    private static synchronized Bitmap getDefaultFavicon(Context context) {
+        if (sDefaultFavicon == null) {
+            sDefaultFavicon = BitmapFactory.decodeResource(
+                    context.getResources(), R.drawable.app_web_browser_sm);
+        }
+        return sDefaultFavicon;
     }
+
+    // All the state needed for a page
+    protected static class PageState {
+        String mUrl;
+        String mOriginalUrl;
+        String mTitle;
+        SecurityState mSecurityState;
+        // This is non-null only when mSecurityState is SECURITY_STATE_BAD_CERTIFICATE.
+        SslError mSslCertificateError;
+        Bitmap mFavicon;
+        boolean mIsBookmarkedSite;
+        boolean mIncognito;
+
+        PageState(Context c, boolean incognito) {
+            mIncognito = incognito;
+            if (mIncognito) {
+                mOriginalUrl = mUrl = "browser:incognito";
+                mTitle = c.getString(R.string.new_incognito_tab);
+            } else {
+                mOriginalUrl = mUrl = "";
+                mTitle = c.getString(R.string.new_tab);
+            }
+            mSecurityState = SecurityState.SECURITY_STATE_NOT_SECURE;
+        }
+
+        PageState(Context c, boolean incognito, String url, Bitmap favicon) {
+            mIncognito = incognito;
+            mOriginalUrl = mUrl = url;
+            if (URLUtil.isHttpsUrl(url)) {
+                mSecurityState = SecurityState.SECURITY_STATE_SECURE;
+            } else {
+                mSecurityState = SecurityState.SECURITY_STATE_NOT_SECURE;
+            }
+            mFavicon = favicon;
+        }
+
+    }
+
+    // The current/loading page's state
+    protected PageState mCurrentState;
 
     // Used for saving and restoring each Tab
-    static final String WEBVIEW = "webview";
-    static final String NUMTABS = "numTabs";
-    static final String CURRTAB = "currentTab";
+    static final String ID = "ID";
     static final String CURRURL = "currentUrl";
     static final String CURRTITLE = "currentTitle";
-    static final String CLOSEONEXIT = "closeonexit";
     static final String PARENTTAB = "parentTab";
     static final String APPID = "appid";
-    static final String ORIGINALURL = "originalUrl";
-
-    // -------------------------------------------------------------------------
-
-    /**
-     * Private information regarding the latest voice search.  If the Tab is not
-     * in voice search mode, this will be null.
-     */
-    private VoiceSearchData mVoiceSearchData;
-    /**
-     * Remove voice search mode from this tab.
-     */
-    public void revertVoiceSearchMode() {
-        if (mVoiceSearchData != null) {
-            mVoiceSearchData = null;
-            if (mInForeground) {
-                mActivity.revertVoiceTitleBar();
-            }
-        }
-    }
-    /**
-     * Return whether the tab is in voice search mode.
-     */
-    public boolean isInVoiceSearchMode() {
-        return mVoiceSearchData != null;
-    }
-    /**
-     * Return true if the Tab is in voice search mode and the voice search
-     * Intent came with a String identifying that Google provided the Intent.
-     */
-    public boolean voiceSearchSourceIsGoogle() {
-        return mVoiceSearchData != null && mVoiceSearchData.mSourceIsGoogle;
-    }
-    /**
-     * Get the title to display for the current voice search page.  If the Tab
-     * is not in voice search mode, return null.
-     */
-    public String getVoiceDisplayTitle() {
-        if (mVoiceSearchData == null) return null;
-        return mVoiceSearchData.mLastVoiceSearchTitle;
-    }
-    /**
-     * Get the latest array of voice search results, to be passed to the
-     * BrowserProvider.  If the Tab is not in voice search mode, return null.
-     */
-    public ArrayList<String> getVoiceSearchResults() {
-        if (mVoiceSearchData == null) return null;
-        return mVoiceSearchData.mVoiceSearchResults;
-    }
-    /**
-     * Activate voice search mode.
-     * @param intent Intent which has the results to use, or an index into the
-     *      results when reusing the old results.
-     */
-    /* package */ void activateVoiceSearchMode(Intent intent) {
-        int index = 0;
-        ArrayList<String> results = intent.getStringArrayListExtra(
-                    RecognizerResultsIntent.EXTRA_VOICE_SEARCH_RESULT_STRINGS);
-        if (results != null) {
-            ArrayList<String> urls = intent.getStringArrayListExtra(
-                        RecognizerResultsIntent.EXTRA_VOICE_SEARCH_RESULT_URLS);
-            ArrayList<String> htmls = intent.getStringArrayListExtra(
-                        RecognizerResultsIntent.EXTRA_VOICE_SEARCH_RESULT_HTML);
-            ArrayList<String> baseUrls = intent.getStringArrayListExtra(
-                        RecognizerResultsIntent
-                        .EXTRA_VOICE_SEARCH_RESULT_HTML_BASE_URLS);
-            // This tab is now entering voice search mode for the first time, or
-            // a new voice search was done.
-            int size = results.size();
-            if (urls == null || size != urls.size()) {
-                throw new AssertionError("improper extras passed in Intent");
-            }
-            if (htmls == null || htmls.size() != size || baseUrls == null ||
-                    (baseUrls.size() != size && baseUrls.size() != 1)) {
-                // If either of these arrays are empty/incorrectly sized, ignore
-                // them.
-                htmls = null;
-                baseUrls = null;
-            }
-            mVoiceSearchData = new VoiceSearchData(results, urls, htmls,
-                    baseUrls);
-            mVoiceSearchData.mHeaders = intent.getParcelableArrayListExtra(
-                    RecognizerResultsIntent
-                    .EXTRA_VOICE_SEARCH_RESULT_HTTP_HEADERS);
-            mVoiceSearchData.mSourceIsGoogle = intent.getBooleanExtra(
-                    VoiceSearchData.SOURCE_IS_GOOGLE, false);
-            mVoiceSearchData.mVoiceSearchIntent = new Intent(intent);
-        }
-        String extraData = intent.getStringExtra(
-                SearchManager.EXTRA_DATA_KEY);
-        if (extraData != null) {
-            index = Integer.parseInt(extraData);
-            if (index >= mVoiceSearchData.mVoiceSearchResults.size()) {
-                throw new AssertionError("index must be less than "
-                        + "size of mVoiceSearchResults");
-            }
-            if (mVoiceSearchData.mSourceIsGoogle) {
-                Intent logIntent = new Intent(
-                        LoggingEvents.ACTION_LOG_EVENT);
-                logIntent.putExtra(LoggingEvents.EXTRA_EVENT,
-                        LoggingEvents.VoiceSearch.N_BEST_CHOOSE);
-                logIntent.putExtra(
-                        LoggingEvents.VoiceSearch.EXTRA_N_BEST_CHOOSE_INDEX,
-                        index);
-                mActivity.sendBroadcast(logIntent);
-            }
-            if (mVoiceSearchData.mVoiceSearchIntent != null) {
-                // Copy the Intent, so that each history item will have its own
-                // Intent, with different (or none) extra data.
-                Intent latest = new Intent(mVoiceSearchData.mVoiceSearchIntent);
-                latest.putExtra(SearchManager.EXTRA_DATA_KEY, extraData);
-                mVoiceSearchData.mVoiceSearchIntent = latest;
-            }
-        }
-        mVoiceSearchData.mLastVoiceSearchTitle
-                = mVoiceSearchData.mVoiceSearchResults.get(index);
-        if (mInForeground) {
-            mActivity.showVoiceTitleBar(mVoiceSearchData.mLastVoiceSearchTitle);
-        }
-        if (mVoiceSearchData.mVoiceSearchHtmls != null) {
-            // When index was found it was already ensured that it was valid
-            String uriString = mVoiceSearchData.mVoiceSearchHtmls.get(index);
-            if (uriString != null) {
-                Uri dataUri = Uri.parse(uriString);
-                if (RecognizerResultsIntent.URI_SCHEME_INLINE.equals(
-                        dataUri.getScheme())) {
-                    // If there is only one base URL, use it.  If there are
-                    // more, there will be one for each index, so use the base
-                    // URL corresponding to the index.
-                    String baseUrl = mVoiceSearchData.mVoiceSearchBaseUrls.get(
-                            mVoiceSearchData.mVoiceSearchBaseUrls.size() > 1 ?
-                            index : 0);
-                    mVoiceSearchData.mLastVoiceSearchUrl = baseUrl;
-                    mMainView.loadDataWithBaseURL(baseUrl,
-                            uriString.substring(RecognizerResultsIntent
-                            .URI_SCHEME_INLINE.length() + 1), "text/html",
-                            "utf-8", baseUrl);
-                    return;
-                }
-            }
-        }
-        mVoiceSearchData.mLastVoiceSearchUrl
-                = mVoiceSearchData.mVoiceSearchUrls.get(index);
-        if (null == mVoiceSearchData.mLastVoiceSearchUrl) {
-            mVoiceSearchData.mLastVoiceSearchUrl = mActivity.smartUrlFilter(
-                    mVoiceSearchData.mLastVoiceSearchTitle);
-        }
-        Map<String, String> headers = null;
-        if (mVoiceSearchData.mHeaders != null) {
-            int bundleIndex = mVoiceSearchData.mHeaders.size() == 1 ? 0
-                    : index;
-            Bundle bundle = mVoiceSearchData.mHeaders.get(bundleIndex);
-            if (bundle != null && !bundle.isEmpty()) {
-                Iterator<String> iter = bundle.keySet().iterator();
-                headers = new HashMap<String, String>();
-                while (iter.hasNext()) {
-                    String key = iter.next();
-                    headers.put(key, bundle.getString(key));
-                }
-            }
-        }
-        mMainView.loadUrl(mVoiceSearchData.mLastVoiceSearchUrl, headers);
-    }
-    /* package */ static class VoiceSearchData {
-        public VoiceSearchData(ArrayList<String> results,
-                ArrayList<String> urls, ArrayList<String> htmls,
-                ArrayList<String> baseUrls) {
-            mVoiceSearchResults = results;
-            mVoiceSearchUrls = urls;
-            mVoiceSearchHtmls = htmls;
-            mVoiceSearchBaseUrls = baseUrls;
-        }
-        /*
-         * ArrayList of suggestions to be displayed when opening the
-         * SearchManager
-         */
-        public ArrayList<String> mVoiceSearchResults;
-        /*
-         * ArrayList of urls, associated with the suggestions in
-         * mVoiceSearchResults.
-         */
-        public ArrayList<String> mVoiceSearchUrls;
-        /*
-         * ArrayList holding content to load for each item in
-         * mVoiceSearchResults.
-         */
-        public ArrayList<String> mVoiceSearchHtmls;
-        /*
-         * ArrayList holding base urls for the items in mVoiceSearchResults.
-         * If non null, this will either have the same size as
-         * mVoiceSearchResults or have a size of 1, in which case all will use
-         * the same base url
-         */
-        public ArrayList<String> mVoiceSearchBaseUrls;
-        /*
-         * The last url provided by voice search.  Used for comparison to see if
-         * we are going to a page by some method besides voice search.
-         */
-        public String mLastVoiceSearchUrl;
-        /**
-         * The last title used for voice search.  Needed to update the title bar
-         * when switching tabs.
-         */
-        public String mLastVoiceSearchTitle;
-        /**
-         * Whether the Intent which turned on voice search mode contained the
-         * String signifying that Google was the source.
-         */
-        public boolean mSourceIsGoogle;
-        /**
-         * List of headers to be passed into the WebView containing location
-         * information
-         */
-        public ArrayList<Bundle> mHeaders;
-        /**
-         * The Intent used to invoke voice search.  Placed on the
-         * WebHistoryItem so that when coming back to a previous voice search
-         * page we can again activate voice search.
-         */
-        public Intent mVoiceSearchIntent;
-        /**
-         * String used to identify Google as the source of voice search.
-         */
-        public static String SOURCE_IS_GOOGLE
-                = "android.speech.extras.SOURCE_IS_GOOGLE";
-    }
+    static final String INCOGNITO = "privateBrowsingEnabled";
+    static final String USERAGENT = "useragent";
+    static final String CLOSEFLAG = "closeOnBack";
 
     // Container class for the next error dialog that needs to be displayed
     private class ErrorDialog {
@@ -392,7 +262,7 @@ class Tab {
             mDescription = desc;
             mError = error;
         }
-    };
+    }
 
     private void processNextError() {
         if (mQueuedErrors == null) {
@@ -440,7 +310,7 @@ class Tab {
 
     private void showError(ErrorDialog errDialog) {
         if (mInForeground) {
-            AlertDialog d = new AlertDialog.Builder(mActivity)
+            AlertDialog d = new AlertDialog.Builder(mContext)
                     .setTitle(errDialog.mTitle)
                     .setMessage(errDialog.mDescription)
                     .setPositiveButton(R.string.ok, null)
@@ -454,29 +324,24 @@ class Tab {
     // WebViewClient implementation for the main WebView
     // -------------------------------------------------------------------------
 
-    private final WebViewClient mWebViewClient = new WebViewClient() {
+    private final WebViewClientClassicExt mWebViewClient = new WebViewClientClassicExt() {
         private Message mDontResend;
         private Message mResend;
+
+        private boolean providersDiffer(String url, String otherUrl) {
+            Uri uri1 = Uri.parse(url);
+            Uri uri2 = Uri.parse(otherUrl);
+            return !uri1.getEncodedAuthority().equals(uri2.getEncodedAuthority());
+        }
+
         @Override
         public void onPageStarted(WebView view, String url, Bitmap favicon) {
-            mInLoad = true;
+            mInPageLoad = true;
+            mUpdateThumbnail = true;
+            mPageLoadProgress = INITIAL_PROGRESS;
+            mCurrentState = new PageState(mContext,
+                    view.isPrivateBrowsingEnabled(), url, favicon);
             mLoadStartTime = SystemClock.uptimeMillis();
-            if (mVoiceSearchData != null
-                    && !url.equals(mVoiceSearchData.mLastVoiceSearchUrl)) {
-                if (mVoiceSearchData.mSourceIsGoogle) {
-                    Intent i = new Intent(LoggingEvents.ACTION_LOG_EVENT);
-                    i.putExtra(LoggingEvents.EXTRA_FLUSH, true);
-                    mActivity.sendBroadcast(i);
-                }
-                revertVoiceSearchMode();
-            }
-
-            // We've started to load a new page. If there was a pending message
-            // to save a screenshot then we will now take the new page and save
-            // an incorrect screenshot. Therefore, remove any pending thumbnail
-            // messages from the queue.
-            mActivity.removeMessages(BrowserActivity.UPDATE_BOOKMARK_THUMBNAIL,
-                    view);
 
             // If we start a touch icon load and then load a new page, we don't
             // want to cancel the current touch icon loader. But, we do want to
@@ -489,89 +354,63 @@ class Tab {
             // reset the error console
             if (mErrorConsole != null) {
                 mErrorConsole.clearErrorMessages();
-                if (mActivity.shouldShowErrorConsole()) {
+                if (mWebViewController.shouldShowErrorConsole()) {
                     mErrorConsole.showConsole(ErrorConsoleView.SHOW_NONE);
                 }
             }
 
-            // update the bookmark database for favicon
-            if (favicon != null) {
-                BrowserBookmarksAdapter.updateBookmarkFavicon(mActivity
-                        .getContentResolver(), null, url, favicon);
-            }
-
-            // reset sync timer to avoid sync starts during loading a page
-            CookieSyncManager.getInstance().resetSync();
-
-            if (!mActivity.isNetworkUp()) {
-                view.setNetworkAvailable(false);
+            // Cancel the auto-login process.
+            if (mDeviceAccountLogin != null) {
+                mDeviceAccountLogin.cancel();
+                mDeviceAccountLogin = null;
+                mWebViewController.hideAutoLogin(Tab.this);
             }
 
             // finally update the UI in the activity if it is in the foreground
-            if (mInForeground) {
-                mActivity.onPageStarted(view, url, favicon);
-            }
+            mWebViewController.onPageStarted(Tab.this, view, favicon);
+
+            updateBookmarkedStatus();
         }
 
         @Override
         public void onPageFinished(WebView view, String url) {
-            LogTag.logPageFinishedLoading(
-                    url, SystemClock.uptimeMillis() - mLoadStartTime);
-            mInLoad = false;
-
-            if (mInForeground && !mActivity.didUserStopLoading()
-                    || !mInForeground) {
-                // Only update the bookmark screenshot if the user did not
-                // cancel the load early.
-                mActivity.postMessage(
-                        BrowserActivity.UPDATE_BOOKMARK_THUMBNAIL, 0, 0, view,
-                        500);
+            mDisableOverrideUrlLoading = false;
+            if (!isPrivateBrowsingEnabled()) {
+                LogTag.logPageFinishedLoading(
+                        url, SystemClock.uptimeMillis() - mLoadStartTime);
             }
-
-            // finally update the UI in the activity if it is in the foreground
-            if (mInForeground) {
-                mActivity.onPageFinished(view, url);
-            }
+            syncCurrentState(view, url);
+            mWebViewController.onPageFinished(Tab.this);
         }
 
         // return true if want to hijack the url to let another app to handle it
         @Override
         public boolean shouldOverrideUrlLoading(WebView view, String url) {
-            if (voiceSearchSourceIsGoogle()) {
-                // This method is called when the user clicks on a link.
-                // VoiceSearchMode is turned off when the user leaves the
-                // Google results page, so at this point the user must be on
-                // that page.  If the user clicked a link on that page, assume
-                // that the voice search was effective, and broadcast an Intent
-                // so a receiver can take note of that fact.
-                Intent logIntent = new Intent(LoggingEvents.ACTION_LOG_EVENT);
-                logIntent.putExtra(LoggingEvents.EXTRA_EVENT,
-                        LoggingEvents.VoiceSearch.RESULT_CLICKED);
-                mActivity.sendBroadcast(logIntent);
-            }
-            if (mInForeground) {
-                return mActivity.shouldOverrideUrlLoading(view, url);
+            if (!mDisableOverrideUrlLoading && mInForeground) {
+                return mWebViewController.shouldOverrideUrlLoading(Tab.this,
+                        view, url);
             } else {
                 return false;
             }
         }
 
         /**
-         * Updates the lock icon. This method is called when we discover another
-         * resource to be loaded for this page (for example, javascript). While
-         * we update the icon type, we do not update the lock icon itself until
-         * we are done loading, it is slightly more secure this way.
+         * Updates the security state. This method is called when we discover
+         * another resource to be loaded for this page (for example,
+         * javascript). While we update the security state, we do not update
+         * the lock icon until we are done loading, as it is slightly more
+         * secure this way.
          */
         @Override
         public void onLoadResource(WebView view, String url) {
             if (url != null && url.length() > 0) {
                 // It is only if the page claims to be secure that we may have
-                // to update the lock:
-                if (mLockIconType == BrowserActivity.LOCK_ICON_SECURE) {
-                    // If NOT a 'safe' url, change the lock to mixed content!
+                // to update the security state:
+                if (mCurrentState.mSecurityState == SecurityState.SECURITY_STATE_SECURE) {
+                    // If NOT a 'safe' url, change the state to mixed content!
                     if (!(URLUtil.isHttpsUrl(url) || URLUtil.isDataUrl(url)
                             || URLUtil.isAboutUrl(url))) {
-                        mLockIconType = BrowserActivity.LOCK_ICON_MIXED;
+                        mCurrentState.mSecurityState = SecurityState.SECURITY_STATE_MIXED;
                     }
                 }
             }
@@ -590,13 +429,12 @@ class Tab {
                     errorCode != WebViewClient.ERROR_UNSUPPORTED_SCHEME &&
                     errorCode != WebViewClient.ERROR_FILE) {
                 queueError(errorCode, description);
-            }
-            Log.e(LOGTAG, "onReceivedError " + errorCode + " " + failingUrl
-                    + " " + description);
 
-            // We need to reset the title after an error if it is in foreground.
-            if (mInForeground) {
-                mActivity.resetTitleAndRevertLockIcon();
+                // Don't log URLs when in private browsing mode
+                if (!isPrivateBrowsingEnabled()) {
+                    Log.e(LOGTAG, "onReceivedError " + errorCode + " " + failingUrl
+                        + " " + description);
+                }
             }
         }
 
@@ -619,7 +457,7 @@ class Tab {
             }
             mDontResend = dontResend;
             mResend = resend;
-            new AlertDialog.Builder(mActivity).setTitle(
+            new AlertDialog.Builder(mContext).setTitle(
                     R.string.browserFrameFormResubmitLabel).setMessage(
                     R.string.browserFrameFormResubmitMessage)
                     .setPositiveButton(R.string.ok,
@@ -662,31 +500,7 @@ class Tab {
         @Override
         public void doUpdateVisitedHistory(WebView view, String url,
                 boolean isReload) {
-            if (url.regionMatches(true, 0, "about:", 0, 6)) {
-                return;
-            }
-            // remove "client" before updating it to the history so that it wont
-            // show up in the auto-complete list.
-            int index = url.indexOf("client=ms-");
-            if (index > 0 && url.contains(".google.")) {
-                int end = url.indexOf('&', index);
-                if (end > 0) {
-                    url = url.substring(0, index)
-                            .concat(url.substring(end + 1));
-                } else {
-                    // the url.charAt(index-1) should be either '?' or '&'
-                    url = url.substring(0, index-1);
-                }
-            }
-            final ContentResolver cr = mActivity.getContentResolver();
-            final String newUrl = url;
-            new AsyncTask<Void, Void, Void>() {
-                protected Void doInBackground(Void... unused) {
-                    Browser.updateVisitedHistory(cr, newUrl, true);
-                    return null;
-                }
-            }.execute();
-            WebIconDatabase.getInstance().retainIconForPageUrl(url);
+            mWebViewController.doUpdateVisitedHistory(Tab.this, isReload);
         }
 
         /**
@@ -697,81 +511,102 @@ class Tab {
                 final SslErrorHandler handler, final SslError error) {
             if (!mInForeground) {
                 handler.cancel();
+                setSecurityState(SecurityState.SECURITY_STATE_NOT_SECURE);
                 return;
             }
-            if (BrowserSettings.getInstance().showSecurityWarnings()) {
-                final LayoutInflater factory =
-                    LayoutInflater.from(mActivity);
-                final View warningsView =
-                    factory.inflate(R.layout.ssl_warnings, null);
-                final LinearLayout placeholder =
-                    (LinearLayout)warningsView.findViewById(R.id.placeholder);
-
-                if (error.hasError(SslError.SSL_UNTRUSTED)) {
-                    LinearLayout ll = (LinearLayout)factory
-                        .inflate(R.layout.ssl_warning, null);
-                    ((TextView)ll.findViewById(R.id.warning))
-                        .setText(R.string.ssl_untrusted);
-                    placeholder.addView(ll);
-                }
-
-                if (error.hasError(SslError.SSL_IDMISMATCH)) {
-                    LinearLayout ll = (LinearLayout)factory
-                        .inflate(R.layout.ssl_warning, null);
-                    ((TextView)ll.findViewById(R.id.warning))
-                        .setText(R.string.ssl_mismatch);
-                    placeholder.addView(ll);
-                }
-
-                if (error.hasError(SslError.SSL_EXPIRED)) {
-                    LinearLayout ll = (LinearLayout)factory
-                        .inflate(R.layout.ssl_warning, null);
-                    ((TextView)ll.findViewById(R.id.warning))
-                        .setText(R.string.ssl_expired);
-                    placeholder.addView(ll);
-                }
-
-                if (error.hasError(SslError.SSL_NOTYETVALID)) {
-                    LinearLayout ll = (LinearLayout)factory
-                        .inflate(R.layout.ssl_warning, null);
-                    ((TextView)ll.findViewById(R.id.warning))
-                        .setText(R.string.ssl_not_yet_valid);
-                    placeholder.addView(ll);
-                }
-
-                new AlertDialog.Builder(mActivity).setTitle(
-                        R.string.security_warning).setIcon(
-                        android.R.drawable.ic_dialog_alert).setView(
-                        warningsView).setPositiveButton(R.string.ssl_continue,
+            if (mSettings.showSecurityWarnings()) {
+                new AlertDialog.Builder(mContext)
+                    .setTitle(R.string.security_warning)
+                    .setMessage(R.string.ssl_warnings_header)
+                    .setIconAttribute(android.R.attr.alertDialogIcon)
+                    .setPositiveButton(R.string.ssl_continue,
                         new DialogInterface.OnClickListener() {
+                            @Override
                             public void onClick(DialogInterface dialog,
                                     int whichButton) {
                                 handler.proceed();
+                                handleProceededAfterSslError(error);
                             }
-                        }).setNeutralButton(R.string.view_certificate,
+                        })
+                    .setNeutralButton(R.string.view_certificate,
                         new DialogInterface.OnClickListener() {
+                            @Override
                             public void onClick(DialogInterface dialog,
                                     int whichButton) {
-                                mActivity.showSSLCertificateOnError(view,
-                                        handler, error);
+                                mWebViewController.showSslCertificateOnError(
+                                        view, handler, error);
                             }
-                        }).setNegativeButton(R.string.cancel,
+                        })
+                    .setNegativeButton(R.string.ssl_go_back,
                         new DialogInterface.OnClickListener() {
+                            @Override
                             public void onClick(DialogInterface dialog,
                                     int whichButton) {
-                                handler.cancel();
-                                mActivity.resetTitleAndRevertLockIcon();
+                                dialog.cancel();
                             }
-                        }).setOnCancelListener(
+                        })
+                    .setOnCancelListener(
                         new DialogInterface.OnCancelListener() {
+                            @Override
                             public void onCancel(DialogInterface dialog) {
                                 handler.cancel();
-                                mActivity.resetTitleAndRevertLockIcon();
+                                setSecurityState(SecurityState.SECURITY_STATE_NOT_SECURE);
+                                mWebViewController.onUserCanceledSsl(Tab.this);
                             }
-                        }).show();
+                        })
+                    .show();
             } else {
                 handler.proceed();
             }
+        }
+
+        /**
+         * Called when an SSL error occurred while loading a resource, but the
+         * WebView but chose to proceed anyway based on a decision retained
+         * from a previous response to onReceivedSslError(). We update our
+         * security state to reflect this.
+         */
+        @Override
+        public void onProceededAfterSslError(WebView view, SslError error) {
+            handleProceededAfterSslError(error);
+        }
+
+        /**
+         * Displays client certificate request to the user.
+         */
+        @Override
+        public void onReceivedClientCertRequest(final WebView view,
+                final ClientCertRequestHandler handler, final String host_and_port) {
+            if (!mInForeground) {
+                handler.ignore();
+                return;
+            }
+            int colon = host_and_port.lastIndexOf(':');
+            String host;
+            int port;
+            if (colon == -1) {
+                host = host_and_port;
+                port = -1;
+            } else {
+                String portString = host_and_port.substring(colon + 1);
+                try {
+                    port = Integer.parseInt(portString);
+                    host = host_and_port.substring(0, colon);
+                } catch  (NumberFormatException e) {
+                    host = host_and_port;
+                    port = -1;
+                }
+            }
+            KeyChain.choosePrivateKeyAlias(
+                    mWebViewController.getActivity(), new KeyChainAliasCallback() {
+                @Override public void alias(String alias) {
+                    if (alias == null) {
+                        handler.cancel();
+                        return;
+                    }
+                    new KeyChainLookup(mContext, handler, alias).execute();
+                }
+            }, null, null, host, port, null);
         }
 
         /**
@@ -785,31 +620,15 @@ class Tab {
         public void onReceivedHttpAuthRequest(WebView view,
                 final HttpAuthHandler handler, final String host,
                 final String realm) {
-            String username = null;
-            String password = null;
+            mWebViewController.onReceivedHttpAuthRequest(Tab.this, view, handler, host, realm);
+        }
 
-            boolean reuseHttpAuthUsernamePassword = handler
-                    .useHttpAuthUsernamePassword();
-
-            if (reuseHttpAuthUsernamePassword && view != null) {
-                String[] credentials = view.getHttpAuthUsernamePassword(
-                        host, realm);
-                if (credentials != null && credentials.length == 2) {
-                    username = credentials[0];
-                    password = credentials[1];
-                }
-            }
-
-            if (username != null && password != null) {
-                handler.proceed(username, password);
-            } else {
-                if (mInForeground) {
-                    mActivity.showHttpAuthentication(handler, host, realm,
-                            null, null, null, 0);
-                } else {
-                    handler.cancel();
-                }
-            }
+        @Override
+        public WebResourceResponse shouldInterceptRequest(WebView view,
+                String url) {
+            WebResourceResponse res = HomeProvider.shouldInterceptRequest(
+                    mContext, url);
+            return res;
         }
 
         @Override
@@ -817,27 +636,56 @@ class Tab {
             if (!mInForeground) {
                 return false;
             }
-            if (mActivity.isMenuDown()) {
-                // only check shortcut key when MENU is held
-                return mActivity.getWindow().isShortcutKey(event.getKeyCode(),
-                        event);
-            } else {
-                return false;
-            }
+            return mWebViewController.shouldOverrideKeyEvent(event);
         }
 
         @Override
         public void onUnhandledKeyEvent(WebView view, KeyEvent event) {
-            if (!mInForeground || mActivity.mActivityInPause) {
+            if (!mInForeground) {
                 return;
             }
-            if (event.isDown()) {
-                mActivity.onKeyDown(event.getKeyCode(), event);
-            } else {
-                mActivity.onKeyUp(event.getKeyCode(), event);
+            if (!mWebViewController.onUnhandledKeyEvent(event)) {
+                super.onUnhandledKeyEvent(view, event);
             }
         }
+
+        @Override
+        public void onReceivedLoginRequest(WebView view, String realm,
+                String account, String args) {
+            new DeviceAccountLogin(mWebViewController.getActivity(), view, Tab.this, mWebViewController)
+                    .handleLogin(realm, account, args);
+        }
+
     };
+
+    private void syncCurrentState(WebView view, String url) {
+        // Sync state (in case of stop/timeout)
+        mCurrentState.mUrl = view.getUrl();
+        if (mCurrentState.mUrl == null) {
+            mCurrentState.mUrl = "";
+        }
+        mCurrentState.mOriginalUrl = view.getOriginalUrl();
+        mCurrentState.mTitle = view.getTitle();
+        mCurrentState.mFavicon = view.getFavicon();
+        if (!URLUtil.isHttpsUrl(mCurrentState.mUrl)) {
+            // In case we stop when loading an HTTPS page from an HTTP page
+            // but before a provisional load occurred
+            mCurrentState.mSecurityState = SecurityState.SECURITY_STATE_NOT_SECURE;
+            mCurrentState.mSslCertificateError = null;
+        }
+        mCurrentState.mIncognito = view.isPrivateBrowsingEnabled();
+    }
+
+    // Called by DeviceAccountLogin when the Tab needs to have the auto-login UI
+    // displayed.
+    void setDeviceAccountLogin(DeviceAccountLogin login) {
+        mDeviceAccountLogin = login;
+    }
+
+    // Returns non-null if the title bar should display the auto-login UI.
+    DeviceAccountLogin getDeviceAccountLogin() {
+        return mDeviceAccountLogin;
+    }
 
     // -------------------------------------------------------------------------
     // WebChromeClient implementation for the main WebView
@@ -850,14 +698,11 @@ class Tab {
                     (WebView.WebViewTransport) msg.obj;
             if (dialog) {
                 createSubWindow();
-                mActivity.attachSubWindow(Tab.this);
+                mWebViewController.attachSubWindow(Tab.this);
                 transport.setWebView(mSubView);
             } else {
-                final Tab newTab = mActivity.openTabAndShow(
-                        BrowserActivity.EMPTY_URL_DATA, false, null);
-                if (newTab != Tab.this) {
-                    Tab.this.addChildTab(newTab);
-                }
+                final Tab newTab = mWebViewController.openTab(null,
+                        Tab.this, true, true);
                 transport.setWebView(newTab.getWebView());
             }
             msg.sendToTarget();
@@ -872,17 +717,17 @@ class Tab {
             }
             // Short-circuit if we can't create any more tabs or sub windows.
             if (dialog && mSubView != null) {
-                new AlertDialog.Builder(mActivity)
+                new AlertDialog.Builder(mContext)
                         .setTitle(R.string.too_many_subwindows_dialog_title)
-                        .setIcon(android.R.drawable.ic_dialog_alert)
+                        .setIconAttribute(android.R.attr.alertDialogIcon)
                         .setMessage(R.string.too_many_subwindows_dialog_message)
                         .setPositiveButton(R.string.ok, null)
                         .show();
                 return false;
-            } else if (!mActivity.getTabControl().canCreateNewTab()) {
-                new AlertDialog.Builder(mActivity)
+            } else if (!mWebViewController.getTabControl().canCreateNewTab()) {
+                new AlertDialog.Builder(mContext)
                         .setTitle(R.string.too_many_windows_dialog_title)
-                        .setIcon(android.R.drawable.ic_dialog_alert)
+                        .setIconAttribute(android.R.attr.alertDialogIcon)
                         .setMessage(R.string.too_many_windows_dialog_message)
                         .setPositiveButton(R.string.ok, null)
                         .show();
@@ -914,9 +759,8 @@ class Tab {
 
             // Build a confirmation dialog to display to the user.
             final AlertDialog d =
-                    new AlertDialog.Builder(mActivity)
-                    .setTitle(R.string.attention)
-                    .setIcon(android.R.drawable.ic_dialog_alert)
+                    new AlertDialog.Builder(mContext)
+                    .setIconAttribute(android.R.attr.alertDialogIcon)
                     .setMessage(R.string.popup_window_attempt)
                     .setPositiveButton(R.string.allow, allowListener)
                     .setNegativeButton(R.string.block, blockListener)
@@ -931,110 +775,49 @@ class Tab {
         @Override
         public void onRequestFocus(WebView view) {
             if (!mInForeground) {
-                mActivity.switchToTab(mActivity.getTabControl().getTabIndex(
-                        Tab.this));
+                mWebViewController.switchToTab(Tab.this);
             }
         }
 
         @Override
         public void onCloseWindow(WebView window) {
-            if (mParentTab != null) {
+            if (mParent != null) {
                 // JavaScript can only close popup window.
                 if (mInForeground) {
-                    mActivity.switchToTab(mActivity.getTabControl()
-                            .getTabIndex(mParentTab));
+                    mWebViewController.switchToTab(mParent);
                 }
-                mActivity.closeTab(Tab.this);
+                mWebViewController.closeTab(Tab.this);
             }
         }
 
         @Override
         public void onProgressChanged(WebView view, int newProgress) {
+            mPageLoadProgress = newProgress;
             if (newProgress == 100) {
-                // sync cookies and cache promptly here.
-                CookieSyncManager.getInstance().sync();
+                mInPageLoad = false;
             }
-            if (mInForeground) {
-                mActivity.onProgressChanged(view, newProgress);
+            mWebViewController.onProgressChanged(Tab.this);
+            if (mUpdateThumbnail && newProgress == 100) {
+                mUpdateThumbnail = false;
             }
         }
 
         @Override
         public void onReceivedTitle(WebView view, final String title) {
-            final String pageUrl = view.getUrl();
-            if (mInForeground) {
-                // here, if url is null, we want to reset the title
-                mActivity.setUrlTitle(pageUrl, title);
-            }
-            if (pageUrl == null || pageUrl.length()
-                    >= SQLiteDatabase.SQLITE_MAX_LIKE_PATTERN_LENGTH) {
-                return;
-            }
-            new AsyncTask<Void, Void, Void>() {
-                protected Void doInBackground(Void... unused) {
-                    // See if we can find the current url in our history
-                    // database and add the new title to it.
-                    String url = pageUrl;
-                    if (url.startsWith("http://www.")) {
-                        url = url.substring(11);
-                    } else if (url.startsWith("http://")) {
-                        url = url.substring(4);
-                    }
-                    // Escape wildcards for LIKE operator.
-                    url = url.replace("\\", "\\\\").replace("%", "\\%")
-                            .replace("_", "\\_");
-                    Cursor c = null;
-                    try {
-                        final ContentResolver cr
-                                = mActivity.getContentResolver();
-                        url = "%" + url;
-                        String [] selArgs = new String[] { url };
-                        String where = Browser.BookmarkColumns.URL
-                                + " LIKE ? ESCAPE '\\' AND "
-                                + Browser.BookmarkColumns.BOOKMARK + " = 0";
-                        c = cr.query(Browser.BOOKMARKS_URI, new String[]
-                                { Browser.BookmarkColumns._ID }, where, selArgs,
-                                null);
-                        if (c.moveToFirst()) {
-                            // Current implementation of database only has one
-                            // entry per url.
-                            ContentValues map = new ContentValues();
-                            map.put(Browser.BookmarkColumns.TITLE, title);
-                            String[] projection = new String[]
-                                    { Integer.valueOf(c.getInt(0)).toString() };
-                            cr.update(Browser.BOOKMARKS_URI, map, "_id = ?",
-                                    projection);
-                        }
-                    } catch (IllegalStateException e) {
-                        Log.e(LOGTAG, "Tab onReceived title", e);
-                    } catch (SQLiteException ex) {
-                        Log.e(LOGTAG,
-                                "onReceivedTitle() caught SQLiteException: ",
-                                ex);
-                    } finally {
-                        if (c != null) c.close();
-                    }
-                    return null;
-                }
-            }.execute();
+            mCurrentState.mTitle = title;
+            mWebViewController.onReceivedTitle(Tab.this, title);
         }
 
         @Override
         public void onReceivedIcon(WebView view, Bitmap icon) {
-            if (icon != null) {
-                BrowserBookmarksAdapter.updateBookmarkFavicon(mActivity
-                        .getContentResolver(), view.getOriginalUrl(), view
-                        .getUrl(), icon);
-            }
-            if (mInForeground) {
-                mActivity.setFavicon(icon);
-            }
+            mCurrentState.mFavicon = icon;
+            mWebViewController.onFavicon(Tab.this, view, icon);
         }
 
         @Override
         public void onReceivedTouchIconUrl(WebView view, String url,
                 boolean precomposed) {
-            final ContentResolver cr = mActivity.getContentResolver();
+            final ContentResolver cr = mContext.getContentResolver();
             // Let precomposed icons take precedence over non-composed
             // icons.
             if (precomposed && mTouchIconLoader != null) {
@@ -1043,30 +826,31 @@ class Tab {
             }
             // Have only one async task at a time.
             if (mTouchIconLoader == null) {
-                mTouchIconLoader = new DownloadTouchIcon(Tab.this, cr, view);
+                mTouchIconLoader = new DownloadTouchIcon(Tab.this,
+                        mContext, cr, view);
                 mTouchIconLoader.execute(url);
             }
         }
 
         @Override
-        public void onSelectionDone(WebView view) {
-            if (mInForeground) mActivity.closeDialogs();
-        }
-
-        @Override
-        public void onSelectionStart(WebView view) {
-            if (false && mInForeground) mActivity.showSelectDialog();
-        }
-
-        @Override
         public void onShowCustomView(View view,
                 WebChromeClient.CustomViewCallback callback) {
-            if (mInForeground) mActivity.onShowCustomView(view, callback);
+            Activity activity = mWebViewController.getActivity();
+            if (activity != null) {
+                onShowCustomView(view, activity.getRequestedOrientation(), callback);
+            }
+        }
+
+        @Override
+        public void onShowCustomView(View view, int requestedOrientation,
+                WebChromeClient.CustomViewCallback callback) {
+            if (mInForeground) mWebViewController.showCustomView(Tab.this, view,
+                    requestedOrientation, callback);
         }
 
         @Override
         public void onHideCustomView() {
-            if (mInForeground) mActivity.onHideCustomView();
+            if (mInForeground) mWebViewController.hideCustomView();
         }
 
         /**
@@ -1084,7 +868,7 @@ class Tab {
         public void onExceededDatabaseQuota(String url,
             String databaseIdentifier, long currentQuota, long estimatedSize,
             long totalUsedQuota, WebStorage.QuotaUpdater quotaUpdater) {
-            BrowserSettings.getInstance().getWebStorageSizeManager()
+            mSettings.getWebStorageSizeManager()
                     .onExceededDatabaseQuota(url, databaseIdentifier,
                             currentQuota, estimatedSize, totalUsedQuota,
                             quotaUpdater);
@@ -1103,7 +887,7 @@ class Tab {
         @Override
         public void onReachedMaxAppCacheSize(long spaceNeeded,
                 long totalUsedQuota, WebStorage.QuotaUpdater quotaUpdater) {
-            BrowserSettings.getInstance().getWebStorageSizeManager()
+            mSettings.getWebStorageSizeManager()
                     .onReachedMaxAppCacheSize(spaceNeeded, totalUsedQuota,
                             quotaUpdater);
         }
@@ -1145,11 +929,15 @@ class Tab {
                 // call getErrorConsole(true) so it will create one if needed
                 ErrorConsoleView errorConsole = getErrorConsole(true);
                 errorConsole.addErrorMessage(consoleMessage);
-                if (mActivity.shouldShowErrorConsole()
-                        && errorConsole.getShowState() != ErrorConsoleView.SHOW_MAXIMIZED) {
+                if (mWebViewController.shouldShowErrorConsole()
+                        && errorConsole.getShowState() !=
+                            ErrorConsoleView.SHOW_MAXIMIZED) {
                     errorConsole.showConsole(ErrorConsoleView.SHOW_MINIMIZED);
                 }
             }
+
+            // Don't log console messages in private browsing mode
+            if (isPrivateBrowsingEnabled()) return true;
 
             String message = "Console: " + consoleMessage.message() + " "
                     + consoleMessage.sourceId() +  ":"
@@ -1184,7 +972,7 @@ class Tab {
         @Override
         public Bitmap getDefaultVideoPoster() {
             if (mInForeground) {
-                return mActivity.getDefaultVideoPoster();
+                return mWebViewController.getDefaultVideoPoster();
             }
             return null;
         }
@@ -1197,15 +985,15 @@ class Tab {
         @Override
         public View getVideoLoadingProgressView() {
             if (mInForeground) {
-                return mActivity.getVideoLoadingProgressView();
+                return mWebViewController.getVideoLoadingProgressView();
             }
             return null;
         }
 
         @Override
-        public void openFileChooser(ValueCallback<Uri> uploadMsg) {
+        public void openFileChooser(ValueCallback<Uri> uploadMsg, String acceptType, String capture) {
             if (mInForeground) {
-                mActivity.openFileChooser(uploadMsg);
+                mWebViewController.openFileChooser(uploadMsg, acceptType, capture);
             } else {
                 uploadMsg.onReceiveValue(null);
             }
@@ -1216,17 +1004,42 @@ class Tab {
          */
         @Override
         public void getVisitedHistory(final ValueCallback<String[]> callback) {
-            AsyncTask<Void, Void, String[]> task = new AsyncTask<Void, Void, String[]>() {
-                public String[] doInBackground(Void... unused) {
-                    return Browser.getVisitedHistory(mActivity
-                            .getContentResolver());
-                }
-                public void onPostExecute(String[] result) {
-                    callback.onReceiveValue(result);
-                };
-            };
-            task.execute();
-        };
+            mWebViewController.getVisitedHistory(callback);
+        }
+
+        @Override
+        public void setupAutoFill(Message message) {
+            // Prompt the user to set up their profile.
+            final Message msg = message;
+            AlertDialog.Builder builder = new AlertDialog.Builder(mContext);
+            LayoutInflater inflater = (LayoutInflater) mContext.getSystemService(
+                    Context.LAYOUT_INFLATER_SERVICE);
+            final View layout = inflater.inflate(R.layout.setup_autofill_dialog, null);
+
+            builder.setView(layout)
+                .setPositiveButton(R.string.ok, new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int id) {
+                        CheckBox disableAutoFill = (CheckBox) layout.findViewById(
+                                R.id.setup_autofill_dialog_disable_autofill);
+
+                        if (disableAutoFill.isChecked()) {
+                            // Disable autofill and show a toast with how to turn it on again.
+                            mSettings.setAutofillEnabled(false);
+                            Toast.makeText(mContext,
+                                    R.string.autofill_setup_dialog_negative_toast,
+                                    Toast.LENGTH_LONG).show();
+                        } else {
+                            // Take user to the AutoFill profile editor. When they return,
+                            // we will send the message that we pass here which will trigger
+                            // the form to get filled out with their new profile.
+                            mWebViewController.setupAutoFill(msg);
+                        }
+                    }
+                })
+                .setNegativeButton(R.string.cancel, null)
+                .show();
+        }
     };
 
     // -------------------------------------------------------------------------
@@ -1235,21 +1048,21 @@ class Tab {
 
     // Subclass of WebViewClient used in subwindows to notify the main
     // WebViewClient of certain WebView activities.
-    private static class SubWindowClient extends WebViewClient {
+    private static class SubWindowClient extends WebViewClientClassicExt {
         // The main WebViewClient.
-        private final WebViewClient mClient;
-        private final BrowserActivity mBrowserActivity;
+        private final WebViewClientClassicExt mClient;
+        private final WebViewController mController;
 
-        SubWindowClient(WebViewClient client, BrowserActivity activity) {
+        SubWindowClient(WebViewClientClassicExt client, WebViewController controller) {
             mClient = client;
-            mBrowserActivity = activity;
+            mController = controller;
         }
         @Override
         public void onPageStarted(WebView view, String url, Bitmap favicon) {
             // Unlike the others, do not call mClient's version, which would
             // change the progress bar.  However, we do want to remove the
             // find or select dialog.
-            mBrowserActivity.closeDialogs();
+            mController.endActionMode();
         }
         @Override
         public void doUpdateVisitedHistory(WebView view, String url,
@@ -1264,6 +1077,11 @@ class Tab {
         public void onReceivedSslError(WebView view, SslErrorHandler handler,
                 SslError error) {
             mClient.onReceivedSslError(view, handler, error);
+        }
+        @Override
+        public void onReceivedClientCertRequest(WebView view,
+                ClientCertRequestHandler handler, String host_and_port) {
+            mClient.onReceivedClientCertRequest(view, handler, host_and_port);
         }
         @Override
         public void onReceivedHttpAuthRequest(WebView view,
@@ -1317,88 +1135,153 @@ class Tab {
             if (window != mSubView) {
                 Log.e(LOGTAG, "Can't close the window");
             }
-            mActivity.dismissSubWindow(Tab.this);
+            mWebViewController.dismissSubWindow(Tab.this);
         }
     }
 
     // -------------------------------------------------------------------------
 
     // Construct a new tab
-    Tab(BrowserActivity activity, WebView w, boolean closeOnExit, String appId,
-            String url) {
-        mActivity = activity;
-        mCloseOnExit = closeOnExit;
-        mAppId = appId;
-        mOriginalUrl = url;
-        mLockIconType = BrowserActivity.LOCK_ICON_UNSECURE;
-        mPrevLockIconType = BrowserActivity.LOCK_ICON_UNSECURE;
-        mInLoad = false;
+    Tab(WebViewController wvcontroller, WebView w) {
+        this(wvcontroller, w, null);
+    }
+
+    Tab(WebViewController wvcontroller, Bundle state) {
+        this(wvcontroller, null, state);
+    }
+
+    Tab(WebViewController wvcontroller, WebView w, Bundle state) {
+        mWebViewController = wvcontroller;
+        mContext = mWebViewController.getContext();
+        mSettings = BrowserSettings.getInstance();
+        mDataController = DataController.getInstance(mContext);
+        mCurrentState = new PageState(mContext, w != null
+                ? w.isPrivateBrowsingEnabled() : false);
+        mInPageLoad = false;
         mInForeground = false;
 
-        mInflateService = LayoutInflater.from(activity);
-
-        // The tab consists of a container view, which contains the main
-        // WebView, as well as any other UI elements associated with the tab.
-        mContainer = (LinearLayout) mInflateService.inflate(R.layout.tab, null);
-
-        mDownloadListener = new DownloadListener() {
+        mDownloadListener = new BrowserDownloadListener() {
             public void onDownloadStart(String url, String userAgent,
-                    String contentDisposition, String mimetype,
+                    String contentDisposition, String mimetype, String referer,
                     long contentLength) {
-                mActivity.onDownloadStart(url, userAgent, contentDisposition,
-                        mimetype, contentLength);
-                if (mMainView.copyBackForwardList().getSize() == 0) {
-                    // This Tab was opened for the sole purpose of downloading a
-                    // file. Remove it.
-                    if (mActivity.getTabControl().getCurrentWebView()
-                            == mMainView) {
-                        // In this case, the Tab is still on top.
-                        mActivity.goBackOnePageOrQuit();
-                    } else {
-                        // In this case, it is not.
-                        mActivity.closeTab(Tab.this);
-                    }
-                }
+                mWebViewController.onDownloadStart(Tab.this, url, userAgent, contentDisposition,
+                        mimetype, referer, contentLength);
             }
         };
         mWebBackForwardListClient = new WebBackForwardListClient() {
             @Override
             public void onNewHistoryItem(WebHistoryItem item) {
-                if (isInVoiceSearchMode()) {
-                    item.setCustomData(mVoiceSearchData.mVoiceSearchIntent);
-                }
-            }
-            @Override
-            public void onIndexChanged(WebHistoryItem item, int index) {
-                Object data = item.getCustomData();
-                if (data != null && data instanceof Intent) {
-                    activateVoiceSearchMode((Intent) data);
+                if (mClearHistoryUrlPattern != null) {
+                    boolean match =
+                        mClearHistoryUrlPattern.matcher(item.getOriginalUrl()).matches();
+                    if (LOGD_ENABLED) {
+                        Log.d(LOGTAG, "onNewHistoryItem: match=" + match + "\n\t"
+                                + item.getUrl() + "\n\t"
+                                + mClearHistoryUrlPattern);
+                    }
+                    if (match) {
+                        if (mMainView != null) {
+                            mMainView.clearHistory();
+                        }
+                    }
+                    mClearHistoryUrlPattern = null;
                 }
             }
         };
 
+        mCaptureWidth = mContext.getResources().getDimensionPixelSize(
+                R.dimen.tab_thumbnail_width);
+        mCaptureHeight = mContext.getResources().getDimensionPixelSize(
+                R.dimen.tab_thumbnail_height);
+        updateShouldCaptureThumbnails();
+        restoreState(state);
+        if (getId() == -1) {
+            mId = TabControl.getNextId();
+        }
         setWebView(w);
+        mHandler = new Handler() {
+            @Override
+            public void handleMessage(Message m) {
+                switch (m.what) {
+                case MSG_CAPTURE:
+                    capture();
+                    break;
+                }
+            }
+        };
+    }
+
+    public boolean shouldUpdateThumbnail() {
+        return mUpdateThumbnail;
+    }
+
+    /**
+     * This is used to get a new ID when the tab has been preloaded, before it is displayed and
+     * added to TabControl. Preloaded tabs can be created before restoreInstanceState, leading
+     * to overlapping IDs between the preloaded and restored tabs.
+     */
+    public void refreshIdAfterPreload() {
+        mId = TabControl.getNextId();
+    }
+
+    public void updateShouldCaptureThumbnails() {
+        if (mWebViewController.shouldCaptureThumbnails()) {
+            synchronized (Tab.this) {
+                if (mCapture == null) {
+                    mCapture = Bitmap.createBitmap(mCaptureWidth, mCaptureHeight,
+                            Bitmap.Config.RGB_565);
+                    mCapture.eraseColor(Color.WHITE);
+                    if (mInForeground) {
+                        postCapture();
+                    }
+                }
+            }
+        } else {
+            synchronized (Tab.this) {
+                mCapture = null;
+                deleteThumbnail();
+            }
+        }
+    }
+
+    public void setController(WebViewController ctl) {
+        mWebViewController = ctl;
+        updateShouldCaptureThumbnails();
+    }
+
+    public long getId() {
+        return mId;
+    }
+
+    void setWebView(WebView w) {
+        setWebView(w, true);
     }
 
     /**
      * Sets the WebView for this tab, correctly removing the old WebView from
      * the container view.
      */
-    void setWebView(WebView w) {
+    void setWebView(WebView w, boolean restore) {
         if (mMainView == w) {
             return;
         }
+
         // If the WebView is changing, the page will be reloaded, so any ongoing
         // Geolocation permission requests are void.
         if (mGeolocationPermissionsPrompt != null) {
             mGeolocationPermissionsPrompt.hide();
         }
 
-        // Just remove the old one.
-        FrameLayout wrapper =
-                (FrameLayout) mContainer.findViewById(R.id.webview_wrapper);
-        wrapper.removeView(mMainView);
+        mWebViewController.onSetWebView(this, w);
 
+        if (mMainView != null) {
+            mMainView.setPictureListener(null);
+            if (w != null) {
+                syncCurrentState(w, null);
+            } else {
+                mCurrentState = new PageState(mContext, false);
+            }
+        }
         // set the new one
         mMainView = w;
         // attach the WebViewClient, WebChromeClient and DownloadListener
@@ -1410,7 +1293,21 @@ class Tab {
             // does a redirect after a period of time. The user could have
             // switched to another tab while waiting for the download to start.
             mMainView.setDownloadListener(mDownloadListener);
-            mMainView.setWebBackForwardListClient(mWebBackForwardListClient);
+            getWebViewClassic().setWebBackForwardListClient(mWebBackForwardListClient);
+            TabControl tc = mWebViewController.getTabControl();
+            if (tc != null && tc.getOnThumbnailUpdatedListener() != null) {
+                mMainView.setPictureListener(this);
+            }
+            if (restore && (mSavedState != null)) {
+                restoreUserAgent();
+                WebBackForwardList restoredState
+                        = mMainView.restoreState(mSavedState);
+                if (restoredState == null || restoredState.getSize() == 0) {
+                    Log.w(LOGTAG, "Failed to restore WebView state!");
+                    loadUrl(mCurrentState.mOriginalUrl, null);
+                }
+                mSavedState = null;
+            }
         }
     }
 
@@ -1420,7 +1317,6 @@ class Tab {
     void destroy() {
         if (mMainView != null) {
             dismissSubWindow();
-            BrowserSettings.getInstance().deleteObserver(mMainView.getSettings());
             // save the WebView to call destroy() after detach it from the tab
             WebView webView = mMainView;
             setWebView(null);
@@ -1433,15 +1329,16 @@ class Tab {
      */
     void removeFromTree() {
         // detach the children
-        if (mChildTabs != null) {
-            for(Tab t : mChildTabs) {
-                t.setParentTab(null);
+        if (mChildren != null) {
+            for(Tab t : mChildren) {
+                t.setParent(null);
             }
         }
         // remove itself from the parent list
-        if (mParentTab != null) {
-            mParentTab.mChildTabs.remove(this);
+        if (mParent != null) {
+            mParent.mChildren.remove(this);
         }
+        deleteThumbnail();
     }
 
     /**
@@ -1450,44 +1347,27 @@ class Tab {
      */
     boolean createSubWindow() {
         if (mSubView == null) {
-            mActivity.closeDialogs();
-            mSubViewContainer = mInflateService.inflate(
-                    R.layout.browser_subwindow, null);
-            mSubView = (WebView) mSubViewContainer.findViewById(R.id.webview);
-            mSubView.setScrollBarStyle(View.SCROLLBARS_OUTSIDE_OVERLAY);
-            // use trackball directly
-            mSubView.setMapTrackballToArrowKeys(false);
-            // Enable the built-in zoom
-            mSubView.getSettings().setBuiltInZoomControls(true);
+            mWebViewController.createSubWindow(this);
             mSubView.setWebViewClient(new SubWindowClient(mWebViewClient,
-                    mActivity));
+                    mWebViewController));
             mSubView.setWebChromeClient(new SubWindowChromeClient(
                     mWebChromeClient));
             // Set a different DownloadListener for the mSubView, since it will
             // just need to dismiss the mSubView, rather than close the Tab
-            mSubView.setDownloadListener(new DownloadListener() {
+            mSubView.setDownloadListener(new BrowserDownloadListener() {
                 public void onDownloadStart(String url, String userAgent,
-                        String contentDisposition, String mimetype,
+                        String contentDisposition, String mimetype, String referer,
                         long contentLength) {
-                    mActivity.onDownloadStart(url, userAgent,
-                            contentDisposition, mimetype, contentLength);
+                    mWebViewController.onDownloadStart(Tab.this, url, userAgent,
+                            contentDisposition, mimetype, referer, contentLength);
                     if (mSubView.copyBackForwardList().getSize() == 0) {
                         // This subwindow was opened for the sole purpose of
                         // downloading a file. Remove it.
-                        mActivity.dismissSubWindow(Tab.this);
+                        mWebViewController.dismissSubWindow(Tab.this);
                     }
                 }
             });
-            mSubView.setOnCreateContextMenuListener(mActivity);
-            final BrowserSettings s = BrowserSettings.getInstance();
-            s.addObserver(mSubView.getSettings()).update(s, null);
-            final ImageButton cancel = (ImageButton) mSubViewContainer
-                    .findViewById(R.id.subwindow_close);
-            cancel.setOnClickListener(new OnClickListener() {
-                public void onClick(View v) {
-                    mSubView.getWebChromeClient().onCloseWindow(mSubView);
-                }
-            });
+            mSubView.setOnCreateContextMenuListener(mWebViewController.getActivity());
             return true;
         }
         return false;
@@ -1498,111 +1378,52 @@ class Tab {
      */
     void dismissSubWindow() {
         if (mSubView != null) {
-            mActivity.closeDialogs();
-            BrowserSettings.getInstance().deleteObserver(
-                    mSubView.getSettings());
+            mWebViewController.endActionMode();
             mSubView.destroy();
             mSubView = null;
             mSubViewContainer = null;
         }
     }
 
-    /**
-     * Attach the sub window to the content view.
-     */
-    void attachSubWindow(ViewGroup content) {
-        if (mSubView != null) {
-            content.addView(mSubViewContainer,
-                    BrowserActivity.COVER_SCREEN_PARAMS);
-        }
-    }
-
-    /**
-     * Remove the sub window from the content view.
-     */
-    void removeSubWindow(ViewGroup content) {
-        if (mSubView != null) {
-            content.removeView(mSubViewContainer);
-            mActivity.closeDialogs();
-        }
-    }
-
-    /**
-     * This method attaches both the WebView and any sub window to the
-     * given content view.
-     */
-    void attachTabToContentView(ViewGroup content) {
-        if (mMainView == null) {
-            return;
-        }
-
-        // Attach the WebView to the container and then attach the
-        // container to the content view.
-        FrameLayout wrapper =
-                (FrameLayout) mContainer.findViewById(R.id.webview_wrapper);
-        ViewGroup parent = (ViewGroup) mMainView.getParent();
-        if (parent != wrapper) {
-            if (parent != null) {
-                Log.w(LOGTAG, "mMainView already has a parent in"
-                        + " attachTabToContentView!");
-                parent.removeView(mMainView);
-            }
-            wrapper.addView(mMainView);
-        } else {
-            Log.w(LOGTAG, "mMainView is already attached to wrapper in"
-                    + " attachTabToContentView!");
-        }
-        parent = (ViewGroup) mContainer.getParent();
-        if (parent != content) {
-            if (parent != null) {
-                Log.w(LOGTAG, "mContainer already has a parent in"
-                        + " attachTabToContentView!");
-                parent.removeView(mContainer);
-            }
-            content.addView(mContainer, BrowserActivity.COVER_SCREEN_PARAMS);
-        } else {
-            Log.w(LOGTAG, "mContainer is already attached to content in"
-                    + " attachTabToContentView!");
-        }
-        attachSubWindow(content);
-    }
-
-    /**
-     * Remove the WebView and any sub window from the given content view.
-     */
-    void removeTabFromContentView(ViewGroup content) {
-        if (mMainView == null) {
-            return;
-        }
-
-        // Remove the container from the content and then remove the
-        // WebView from the container. This will trigger a focus change
-        // needed by WebView.
-        FrameLayout wrapper =
-                (FrameLayout) mContainer.findViewById(R.id.webview_wrapper);
-        wrapper.removeView(mMainView);
-        content.removeView(mContainer);
-        mActivity.closeDialogs();
-        removeSubWindow(content);
-    }
 
     /**
      * Set the parent tab of this tab.
      */
-    void setParentTab(Tab parent) {
-        mParentTab = parent;
+    void setParent(Tab parent) {
+        if (parent == this) {
+            throw new IllegalStateException("Cannot set parent to self!");
+        }
+        mParent = parent;
         // This tab may have been freed due to low memory. If that is the case,
-        // the parent tab index is already saved. If we are changing that index
+        // the parent tab id is already saved. If we are changing that id
         // (most likely due to removing the parent tab) we must update the
-        // parent tab index in the saved Bundle.
+        // parent tab id in the saved Bundle.
         if (mSavedState != null) {
             if (parent == null) {
                 mSavedState.remove(PARENTTAB);
             } else {
-                mSavedState.putInt(PARENTTAB, mActivity.getTabControl()
-                        .getTabIndex(parent));
+                mSavedState.putLong(PARENTTAB, parent.getId());
             }
         }
+
+        // Sync the WebView useragent with the parent
+        if (parent != null && mSettings.hasDesktopUseragent(parent.getWebView())
+                != mSettings.hasDesktopUseragent(getWebView())) {
+            mSettings.toggleDesktopUseragent(getWebView());
+        }
+
+        if (parent != null && parent.getId() == getId()) {
+            throw new IllegalStateException("Parent has same ID as child!");
+        }
+    }
+
+    /**
+     * If this Tab was created through another Tab, then this method returns
+     * that Tab.
+     * @return the Tab parent or null
+     */
+    public Tab getParent() {
+        return mParent;
     }
 
     /**
@@ -1611,23 +1432,34 @@ class Tab {
      * @param child the Tab that was created from this Tab
      */
     void addChildTab(Tab child) {
-        if (mChildTabs == null) {
-            mChildTabs = new Vector<Tab>();
+        if (mChildren == null) {
+            mChildren = new Vector<Tab>();
         }
-        mChildTabs.add(child);
-        child.setParentTab(this);
+        mChildren.add(child);
+        child.setParent(this);
     }
 
-    Vector<Tab> getChildTabs() {
-        return mChildTabs;
+    Vector<Tab> getChildren() {
+        return mChildren;
     }
 
     void resume() {
         if (mMainView != null) {
+            setupHwAcceleration(mMainView);
             mMainView.onResume();
             if (mSubView != null) {
                 mSubView.onResume();
             }
+        }
+    }
+
+    private void setupHwAcceleration(View web) {
+        if (web == null) return;
+        BrowserSettings settings = BrowserSettings.getInstance();
+        if (settings.isHardwareAccelerated()) {
+            web.setLayerType(View.LAYER_TYPE_NONE, null);
+        } else {
+            web.setLayerType(View.LAYER_TYPE_SOFTWARE, null);
         }
     }
 
@@ -1641,25 +1473,38 @@ class Tab {
     }
 
     void putInForeground() {
+        if (mInForeground) {
+            return;
+        }
         mInForeground = true;
         resume();
-        mMainView.setOnCreateContextMenuListener(mActivity);
+        Activity activity = mWebViewController.getActivity();
+        mMainView.setOnCreateContextMenuListener(activity);
         if (mSubView != null) {
-            mSubView.setOnCreateContextMenuListener(mActivity);
+            mSubView.setOnCreateContextMenuListener(activity);
         }
         // Show the pending error dialog if the queue is not empty
         if (mQueuedErrors != null && mQueuedErrors.size() >  0) {
             showError(mQueuedErrors.getFirst());
         }
+        mWebViewController.bookmarkedStatusHasChanged(this);
     }
 
     void putInBackground() {
+        if (!mInForeground) {
+            return;
+        }
+        capture();
         mInForeground = false;
         pause();
         mMainView.setOnCreateContextMenuListener(null);
         if (mSubView != null) {
             mSubView.setOnCreateContextMenuListener(null);
         }
+    }
+
+    boolean inForeground() {
+        return mInForeground;
     }
 
     /**
@@ -1685,11 +1530,49 @@ class Tab {
     }
 
     /**
+     * Return the underlying WebViewClassic implementation. As with getWebView,
+     * this maybe null for background tabs.
+     * @return The main WebView of this tab.
+     */
+    WebViewClassic getWebViewClassic() {
+        return WebViewClassic.fromWebView(mMainView);
+    }
+
+    void setViewContainer(View container) {
+        mContainer = container;
+    }
+
+    View getViewContainer() {
+        return mContainer;
+    }
+
+    /**
+     * Return whether private browsing is enabled for the main window of
+     * this tab.
+     * @return True if private browsing is enabled.
+     */
+    boolean isPrivateBrowsingEnabled() {
+        return mCurrentState.mIncognito;
+    }
+
+    /**
      * Return the subwindow of this tab or null if there is no subwindow.
      * @return The subwindow of this tab or null.
      */
     WebView getSubWebView() {
         return mSubView;
+    }
+
+    void setSubWebView(WebView subView) {
+        mSubView = subView;
+    }
+
+    View getSubViewContainer() {
+        return mSubViewContainer;
+    }
+
+    void setSubViewContainer(View subViewContainer) {
+        mSubViewContainer = subViewContainer;
     }
 
     /**
@@ -1701,7 +1584,6 @@ class Tab {
                     .findViewById(R.id.geolocation_permissions_prompt);
             mGeolocationPermissionsPrompt = (GeolocationPermissionsPrompt) stub
                     .inflate();
-            mGeolocationPermissionsPrompt.init();
         }
         return mGeolocationPermissionsPrompt;
     }
@@ -1721,55 +1603,47 @@ class Tab {
         mAppId = id;
     }
 
-    /**
-     * @return The original url associated with this Tab
-     */
-    String getOriginalUrl() {
-        return mOriginalUrl;
+    boolean closeOnBack() {
+        return mCloseOnBack;
     }
 
-    /**
-     * Set the original url associated with this tab
-     */
-    void setOriginalUrl(String url) {
-        mOriginalUrl = url;
+    void setCloseOnBack(boolean close) {
+        mCloseOnBack = close;
     }
 
-    /**
-     * Get the url of this tab. Valid after calling populatePickerData, but
-     * before calling wipePickerData, or if the webview has been destroyed.
-     * @return The WebView's url or null.
-     */
     String getUrl() {
-        if (mPickerData != null) {
-            return mPickerData.mUrl;
+        return UrlUtils.filteredUrl(mCurrentState.mUrl);
+    }
+
+    String getOriginalUrl() {
+        if (mCurrentState.mOriginalUrl == null) {
+            return getUrl();
         }
-        return null;
+        return UrlUtils.filteredUrl(mCurrentState.mOriginalUrl);
     }
 
     /**
-     * Get the title of this tab. Valid after calling populatePickerData, but
-     * before calling wipePickerData, or if the webview has been destroyed. If
-     * the url has no title, use the url instead.
-     * @return The WebView's title (or url) or null.
+     * Get the title of this tab.
      */
     String getTitle() {
-        if (mPickerData != null) {
-            return mPickerData.mTitle;
+        if (mCurrentState.mTitle == null && mInPageLoad) {
+            return mContext.getString(R.string.title_bar_loading);
         }
-        return null;
+        return mCurrentState.mTitle;
     }
 
     /**
-     * Get the favicon of this tab. Valid after calling populatePickerData, but
-     * before calling wipePickerData, or if the webview has been destroyed.
-     * @return The WebView's favicon or null.
+     * Get the favicon of this tab.
      */
     Bitmap getFavicon() {
-        if (mPickerData != null) {
-            return mPickerData.mFavicon;
+        if (mCurrentState.mFavicon != null) {
+            return mCurrentState.mFavicon;
         }
-        return null;
+        return getDefaultFavicon(mContext);
+    }
+
+    public boolean isBookmarkedSite() {
+        return mCurrentState.mIsBookmarkedSite;
     }
 
     /**
@@ -1782,215 +1656,388 @@ class Tab {
      */
     ErrorConsoleView getErrorConsole(boolean createIfNecessary) {
         if (createIfNecessary && mErrorConsole == null) {
-            mErrorConsole = new ErrorConsoleView(mActivity);
+            mErrorConsole = new ErrorConsoleView(mContext);
             mErrorConsole.setWebView(mMainView);
         }
         return mErrorConsole;
     }
 
     /**
-     * If this Tab was created through another Tab, then this method returns
-     * that Tab.
-     * @return the Tab parent or null
+     * Sets the security state, clears the SSL certificate error and informs
+     * the controller.
      */
-    public Tab getParentTab() {
-        return mParentTab;
+    private void setSecurityState(SecurityState securityState) {
+        mCurrentState.mSecurityState = securityState;
+        mCurrentState.mSslCertificateError = null;
+        mWebViewController.onUpdatedSecurityState(this);
     }
 
     /**
-     * Return whether this tab should be closed when it is backing out of the
-     * first page.
-     * @return TRUE if this tab should be closed when exit.
+     * @return The tab's security state.
      */
-    boolean closeOnExit() {
-        return mCloseOnExit;
+    SecurityState getSecurityState() {
+        return mCurrentState.mSecurityState;
     }
 
     /**
-     * Saves the current lock-icon state before resetting the lock icon. If we
-     * have an error, we may need to roll back to the previous state.
+     * Gets the SSL certificate error, if any, for the page's main resource.
+     * This is only non-null when the security state is
+     * SECURITY_STATE_BAD_CERTIFICATE.
      */
-    void resetLockIcon(String url) {
-        mPrevLockIconType = mLockIconType;
-        mLockIconType = BrowserActivity.LOCK_ICON_UNSECURE;
-        if (URLUtil.isHttpsUrl(url)) {
-            mLockIconType = BrowserActivity.LOCK_ICON_SECURE;
+    SslError getSslCertificateError() {
+        return mCurrentState.mSslCertificateError;
+    }
+
+    int getLoadProgress() {
+        if (mInPageLoad) {
+            return mPageLoadProgress;
         }
-    }
-
-    /**
-     * Reverts the lock-icon state to the last saved state, for example, if we
-     * had an error, and need to cancel the load.
-     */
-    void revertLockIcon() {
-        mLockIconType = mPrevLockIconType;
-    }
-
-    /**
-     * @return The tab's lock icon type.
-     */
-    int getLockIconType() {
-        return mLockIconType;
+        return 100;
     }
 
     /**
      * @return TRUE if onPageStarted is called while onPageFinished is not
      *         called yet.
      */
-    boolean inLoad() {
-        return mInLoad;
-    }
-
-    // force mInLoad to be false. This should only be called before closing the
-    // tab to ensure BrowserActivity's pauseWebViewTimers() is called correctly.
-    void clearInLoad() {
-        mInLoad = false;
-    }
-
-    void populatePickerData() {
-        if (mMainView == null) {
-            populatePickerDataFromSavedState();
-            return;
-        }
-
-        // FIXME: The only place we cared about subwindow was for
-        // bookmarking (i.e. not when saving state). Was this deliberate?
-        final WebBackForwardList list = mMainView.copyBackForwardList();
-        final WebHistoryItem item = list != null ? list.getCurrentItem() : null;
-        populatePickerData(item);
-    }
-
-    // Populate the picker data using the given history item and the current top
-    // WebView.
-    private void populatePickerData(WebHistoryItem item) {
-        if (item != null && !TextUtils.isEmpty(item.getUrl())) {
-            mPickerData = new PickerData();
-            mPickerData.mUrl = item.getUrl();
-            mPickerData.mTitle = item.getTitle();
-            mPickerData.mFavicon = item.getFavicon();
-            if (mPickerData.mTitle == null) {
-                mPickerData.mTitle = mPickerData.mUrl;
-            }
-        }
-    }
-
-    // Create the PickerData and populate it using the saved state of the tab.
-    void populatePickerDataFromSavedState() {
-        if (mSavedState == null) {
-            return;
-        }
-        mPickerData = new PickerData();
-        mPickerData.mUrl = mSavedState.getString(CURRURL);
-        mPickerData.mTitle = mSavedState.getString(CURRTITLE);
-    }
-
-    void clearPickerData() {
-        mPickerData = null;
+    boolean inPageLoad() {
+        return mInPageLoad;
     }
 
     /**
-     * Get the saved state bundle.
-     * @return
+     * @return The Bundle with the tab's state if it can be saved, otherwise null
      */
-    Bundle getSavedState() {
-        return mSavedState;
-    }
-
-    /**
-     * Set the saved state.
-     */
-    void setSavedState(Bundle state) {
-        mSavedState = state;
-    }
-
-    /**
-     * @return TRUE if succeed in saving the state.
-     */
-    boolean saveState() {
+    public Bundle saveState() {
         // If the WebView is null it means we ran low on memory and we already
         // stored the saved state in mSavedState.
         if (mMainView == null) {
-            return mSavedState != null;
+            return mSavedState;
+        }
+
+        if (TextUtils.isEmpty(mCurrentState.mUrl)) {
+            return null;
         }
 
         mSavedState = new Bundle();
-        final WebBackForwardList list = mMainView.saveState(mSavedState);
-
-        // Store some extra info for displaying the tab in the picker.
-        final WebHistoryItem item = list != null ? list.getCurrentItem() : null;
-        populatePickerData(item);
-
-        if (mPickerData != null && mPickerData.mUrl != null) {
-            mSavedState.putString(CURRURL, mPickerData.mUrl);
+        WebBackForwardList savedList = mMainView.saveState(mSavedState);
+        if (savedList == null || savedList.getSize() == 0) {
+            Log.w(LOGTAG, "Failed to save back/forward list for "
+                    + mCurrentState.mUrl);
         }
-        if (mPickerData != null && mPickerData.mTitle != null) {
-            mSavedState.putString(CURRTITLE, mPickerData.mTitle);
-        }
-        mSavedState.putBoolean(CLOSEONEXIT, mCloseOnExit);
+
+        mSavedState.putLong(ID, mId);
+        mSavedState.putString(CURRURL, mCurrentState.mUrl);
+        mSavedState.putString(CURRTITLE, mCurrentState.mTitle);
+        mSavedState.putBoolean(INCOGNITO, mMainView.isPrivateBrowsingEnabled());
         if (mAppId != null) {
             mSavedState.putString(APPID, mAppId);
         }
-        if (mOriginalUrl != null) {
-            mSavedState.putString(ORIGINALURL, mOriginalUrl);
-        }
+        mSavedState.putBoolean(CLOSEFLAG, mCloseOnBack);
         // Remember the parent tab so the relationship can be restored.
-        if (mParentTab != null) {
-            mSavedState.putInt(PARENTTAB, mActivity.getTabControl().getTabIndex(
-                    mParentTab));
+        if (mParent != null) {
+            mSavedState.putLong(PARENTTAB, mParent.mId);
         }
-        return true;
+        mSavedState.putBoolean(USERAGENT,
+                mSettings.hasDesktopUseragent(getWebView()));
+        return mSavedState;
     }
 
     /*
      * Restore the state of the tab.
      */
-    boolean restoreState(Bundle b) {
-        if (b == null) {
-            return false;
+    private void restoreState(Bundle b) {
+        mSavedState = b;
+        if (mSavedState == null) {
+            return;
         }
         // Restore the internal state even if the WebView fails to restore.
         // This will maintain the app id, original url and close-on-exit values.
-        mSavedState = null;
-        mCloseOnExit = b.getBoolean(CLOSEONEXIT);
+        mId = b.getLong(ID);
         mAppId = b.getString(APPID);
-        mOriginalUrl = b.getString(ORIGINALURL);
+        mCloseOnBack = b.getBoolean(CLOSEFLAG);
+        restoreUserAgent();
+        String url = b.getString(CURRURL);
+        String title = b.getString(CURRTITLE);
+        boolean incognito = b.getBoolean(INCOGNITO);
+        mCurrentState = new PageState(mContext, incognito, url, null);
+        mCurrentState.mTitle = title;
+        synchronized (Tab.this) {
+            if (mCapture != null) {
+                DataController.getInstance(mContext).loadThumbnail(this);
+            }
+        }
+    }
 
-        final WebBackForwardList list = mMainView.restoreState(b);
-        if (list == null) {
+    private void restoreUserAgent() {
+        if (mMainView == null || mSavedState == null) {
+            return;
+        }
+        if (mSavedState.getBoolean(USERAGENT)
+                != mSettings.hasDesktopUseragent(mMainView)) {
+            mSettings.toggleDesktopUseragent(mMainView);
+        }
+    }
+
+    public void updateBookmarkedStatus() {
+        mDataController.queryBookmarkStatus(getUrl(), mIsBookmarkCallback);
+    }
+
+    private DataController.OnQueryUrlIsBookmark mIsBookmarkCallback
+            = new DataController.OnQueryUrlIsBookmark() {
+        @Override
+        public void onQueryUrlIsBookmark(String url, boolean isBookmark) {
+            if (mCurrentState.mUrl.equals(url)) {
+                mCurrentState.mIsBookmarkedSite = isBookmark;
+                mWebViewController.bookmarkedStatusHasChanged(Tab.this);
+            }
+        }
+    };
+
+    public Bitmap getScreenshot() {
+        synchronized (Tab.this) {
+            return mCapture;
+        }
+    }
+
+    public boolean isSnapshot() {
+        return false;
+    }
+
+    private static class SaveCallback implements ValueCallback<Boolean> {
+        boolean mResult;
+
+        @Override
+        public void onReceiveValue(Boolean value) {
+            mResult = value;
+            synchronized (this) {
+                notifyAll();
+            }
+        }
+
+    }
+
+    /**
+     * Must be called on the UI thread
+     */
+    public ContentValues createSnapshotValues() {
+        WebViewClassic web = getWebViewClassic();
+        if (web == null) return null;
+        ContentValues values = new ContentValues();
+        values.put(Snapshots.TITLE, mCurrentState.mTitle);
+        values.put(Snapshots.URL, mCurrentState.mUrl);
+        values.put(Snapshots.BACKGROUND, web.getPageBackgroundColor());
+        values.put(Snapshots.DATE_CREATED, System.currentTimeMillis());
+        values.put(Snapshots.FAVICON, compressBitmap(getFavicon()));
+        Bitmap screenshot = Controller.createScreenshot(mMainView,
+                Controller.getDesiredThumbnailWidth(mContext),
+                Controller.getDesiredThumbnailHeight(mContext));
+        values.put(Snapshots.THUMBNAIL, compressBitmap(screenshot));
+        return values;
+    }
+
+    /**
+     * Probably want to call this on a background thread
+     */
+    public boolean saveViewState(ContentValues values) {
+        WebViewClassic web = getWebViewClassic();
+        if (web == null) return false;
+        String path = UUID.randomUUID().toString();
+        SaveCallback callback = new SaveCallback();
+        OutputStream outs = null;
+        try {
+            outs = mContext.openFileOutput(path, Context.MODE_PRIVATE);
+            GZIPOutputStream stream = new GZIPOutputStream(outs);
+            synchronized (callback) {
+                web.saveViewState(stream, callback);
+                callback.wait();
+            }
+            stream.flush();
+            stream.close();
+        } catch (Exception e) {
+            Log.w(LOGTAG, "Failed to save view state", e);
+            if (outs != null) {
+                try {
+                    outs.close();
+                } catch (IOException ignore) {}
+            }
+            File file = mContext.getFileStreamPath(path);
+            if (file.exists() && !file.delete()) {
+                file.deleteOnExit();
+            }
             return false;
         }
+        File savedFile = mContext.getFileStreamPath(path);
+        if (!callback.mResult) {
+            if (!savedFile.delete()) {
+                savedFile.deleteOnExit();
+            }
+            return false;
+        }
+        long size = savedFile.length();
+        values.put(Snapshots.VIEWSTATE_PATH, path);
+        values.put(Snapshots.VIEWSTATE_SIZE, size);
         return true;
     }
 
-    /*
-     * Opens the find and select text dialogs.  Called by BrowserActivity.
-     */
-    WebView showDialog(WebDialog dialog) {
-        LinearLayout container;
-        WebView view;
-        if (mSubView != null) {
-            view = mSubView;
-            container = (LinearLayout) mSubViewContainer.findViewById(
-                    R.id.inner_container);
-        } else {
-            view = mMainView;
-            container = mContainer;
+    public byte[] compressBitmap(Bitmap bitmap) {
+        if (bitmap == null) {
+            return null;
         }
-        dialog.show();
-        container.addView(dialog, 0, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT));
-        dialog.setWebView(view);
-        return view;
+        ByteArrayOutputStream stream = new ByteArrayOutputStream();
+        bitmap.compress(CompressFormat.PNG, 100, stream);
+        return stream.toByteArray();
     }
 
-    /*
-     * Close the find or select dialog. Called by BrowserActivity.closeDialog.
+    public void loadUrl(String url, Map<String, String> headers) {
+        if (mMainView != null) {
+            mPageLoadProgress = INITIAL_PROGRESS;
+            mInPageLoad = true;
+            mCurrentState = new PageState(mContext, false, url, null);
+            mWebViewController.onPageStarted(this, mMainView, null);
+            mMainView.loadUrl(url, headers);
+        }
+    }
+
+    public void disableUrlOverridingForLoad() {
+        mDisableOverrideUrlLoading = true;
+    }
+
+    protected void capture() {
+        if (mMainView == null || mCapture == null) return;
+        if (mMainView.getContentWidth() <= 0 || mMainView.getContentHeight() <= 0) {
+            return;
+        }
+        Canvas c = new Canvas(mCapture);
+        final int left = mMainView.getScrollX();
+        final int top = mMainView.getScrollY() + mMainView.getVisibleTitleHeight();
+        int state = c.save();
+        c.translate(-left, -top);
+        float scale = mCaptureWidth / (float) mMainView.getWidth();
+        c.scale(scale, scale, left, top);
+        if (mMainView instanceof BrowserWebView) {
+            ((BrowserWebView)mMainView).drawContent(c);
+        } else {
+            mMainView.draw(c);
+        }
+        c.restoreToCount(state);
+        // manually anti-alias the edges for the tilt
+        c.drawRect(0, 0, 1, mCapture.getHeight(), sAlphaPaint);
+        c.drawRect(mCapture.getWidth() - 1, 0, mCapture.getWidth(),
+                mCapture.getHeight(), sAlphaPaint);
+        c.drawRect(0, 0, mCapture.getWidth(), 1, sAlphaPaint);
+        c.drawRect(0, mCapture.getHeight() - 1, mCapture.getWidth(),
+                mCapture.getHeight(), sAlphaPaint);
+        c.setBitmap(null);
+        mHandler.removeMessages(MSG_CAPTURE);
+        persistThumbnail();
+        TabControl tc = mWebViewController.getTabControl();
+        if (tc != null) {
+            OnThumbnailUpdatedListener updateListener
+                    = tc.getOnThumbnailUpdatedListener();
+            if (updateListener != null) {
+                updateListener.onThumbnailUpdated(this);
+            }
+        }
+    }
+
+    @Override
+    public void onNewPicture(WebView view, Picture picture) {
+        postCapture();
+    }
+
+    private void postCapture() {
+        if (!mHandler.hasMessages(MSG_CAPTURE)) {
+            mHandler.sendEmptyMessageDelayed(MSG_CAPTURE, CAPTURE_DELAY);
+        }
+    }
+
+    public boolean canGoBack() {
+        return mMainView != null ? mMainView.canGoBack() : false;
+    }
+
+    public boolean canGoForward() {
+        return mMainView != null ? mMainView.canGoForward() : false;
+    }
+
+    public void goBack() {
+        if (mMainView != null) {
+            mMainView.goBack();
+        }
+    }
+
+    public void goForward() {
+        if (mMainView != null) {
+            mMainView.goForward();
+        }
+    }
+
+    /**
+     * Causes the tab back/forward stack to be cleared once, if the given URL is the next URL
+     * to be added to the stack.
+     *
+     * This is used to ensure that preloaded URLs that are not subsequently seen by the user do
+     * not appear in the back stack.
      */
-    void closeDialog(WebDialog dialog) {
-        // The dialog may be attached to the subwindow.  Ensure that the
-        // correct parent has it removed.
-        LinearLayout parent = (LinearLayout) dialog.getParent();
-        if (parent != null) parent.removeView(dialog);
+    public void clearBackStackWhenItemAdded(Pattern urlPattern) {
+        mClearHistoryUrlPattern = urlPattern;
+    }
+
+    protected void persistThumbnail() {
+        DataController.getInstance(mContext).saveThumbnail(this);
+    }
+
+    protected void deleteThumbnail() {
+        DataController.getInstance(mContext).deleteThumbnail(this);
+    }
+
+    void updateCaptureFromBlob(byte[] blob) {
+        synchronized (Tab.this) {
+            if (mCapture == null) {
+                return;
+            }
+            ByteBuffer buffer = ByteBuffer.wrap(blob);
+            try {
+                mCapture.copyPixelsFromBuffer(buffer);
+            } catch (RuntimeException rex) {
+                Log.e(LOGTAG, "Load capture has mismatched sizes; buffer: "
+                        + buffer.capacity() + " blob: " + blob.length
+                        + "capture: " + mCapture.getByteCount());
+                throw rex;
+            }
+        }
+    }
+
+    @Override
+    public String toString() {
+        StringBuilder builder = new StringBuilder(100);
+        builder.append(mId);
+        builder.append(") has parent: ");
+        if (getParent() != null) {
+            builder.append("true[");
+            builder.append(getParent().getId());
+            builder.append("]");
+        } else {
+            builder.append("false");
+        }
+        builder.append(", incog: ");
+        builder.append(isPrivateBrowsingEnabled());
+        if (!isPrivateBrowsingEnabled()) {
+            builder.append(", title: ");
+            builder.append(getTitle());
+            builder.append(", url: ");
+            builder.append(getUrl());
+        }
+        return builder.toString();
+    }
+
+    private void handleProceededAfterSslError(SslError error) {
+        if (error.getUrl().equals(mCurrentState.mUrl)) {
+            // The security state should currently be SECURITY_STATE_SECURE.
+            setSecurityState(SecurityState.SECURITY_STATE_BAD_CERTIFICATE);
+            mCurrentState.mSslCertificateError = error;
+        } else if (getSecurityState() == SecurityState.SECURITY_STATE_SECURE) {
+            // The page's main resource is secure and this error is for a
+            // sub-resource.
+            setSecurityState(SecurityState.SECURITY_STATE_MIXED);
+        }
     }
 }

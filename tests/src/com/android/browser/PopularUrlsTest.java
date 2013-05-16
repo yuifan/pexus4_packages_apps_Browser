@@ -21,14 +21,18 @@ import android.content.Intent;
 import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Environment;
+import android.provider.Browser;
 import android.test.ActivityInstrumentationTestCase2;
+import android.text.TextUtils;
 import android.util.Log;
+import android.webkit.ClientCertRequestHandler;
 import android.webkit.DownloadListener;
 import android.webkit.HttpAuthHandler;
 import android.webkit.JsPromptResult;
 import android.webkit.JsResult;
 import android.webkit.SslErrorHandler;
 import android.webkit.WebView;
+import android.webkit.WebViewClassic;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -61,6 +65,7 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
     private final static int PAGE_LOAD_TIMEOUT = 120000; // 2 minutes
 
     private BrowserActivity mActivity = null;
+    private Controller mController = null;
     private Instrumentation mInst = null;
     private CountDownLatch mLatch = new CountDownLatch(1);
     private RunStatus mStatus;
@@ -75,8 +80,10 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
         super.setUp();
 
         Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse("about:blank"));
+        i.putExtra(Controller.NO_CRASH_RECOVERY, true);
         setActivityIntent(i);
         mActivity = getActivity();
+        mController = mActivity.getController();
         mInst = getInstrumentation();
         mInst.waitForIdleSync();
 
@@ -92,13 +99,12 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
         super.tearDown();
     }
 
-    static BufferedReader getInputStream() throws FileNotFoundException {
+    BufferedReader getInputStream() throws FileNotFoundException {
         return getInputStream(sInputFile);
     }
 
-    static BufferedReader getInputStream(String inputFile) throws FileNotFoundException {
-        String path = sExternalStorage + File.separator + inputFile;
-        FileReader fileReader = new FileReader(path);
+    BufferedReader getInputStream(String inputFile) throws FileNotFoundException {
+        FileReader fileReader = new FileReader(new File(sExternalStorage, inputFile));
         BufferedReader bufferedReader = new BufferedReader(fileReader);
 
         return bufferedReader;
@@ -109,11 +115,7 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
     }
 
     OutputStreamWriter getOutputStream(String outputFile) throws IOException {
-        String path = sExternalStorage + File.separator + outputFile;
-
-        File file = new File(path);
-
-        return new FileWriter(file, mStatus.getIsRecovery());
+        return new FileWriter(new File(sExternalStorage, outputFile), mStatus.getIsRecovery());
     }
 
     /**
@@ -121,10 +123,20 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
      * and wrapping the WebView's helper clients.
      */
     void setUpBrowser() {
-        Tab tab = mActivity.getTabControl().getCurrentTab();
+        mInst.runOnMainSync(new Runnable() {
+            @Override
+            public void run() {
+                setupBrowserInternal();
+            }
+        });
+    }
+
+    void setupBrowserInternal() {
+        Tab tab = mController.getTabControl().getCurrentTab();
         WebView webView = tab.getWebView();
 
-        webView.setWebChromeClient(new TestWebChromeClient(webView.getWebChromeClient()) {
+        webView.setWebChromeClient(new TestWebChromeClient(
+                WebViewClassic.fromWebView(webView).getWebChromeClient()) {
 
             @Override
             public void onProgressChanged(WebView view, int newProgress) {
@@ -193,7 +205,8 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
             }
         });
 
-        webView.setWebViewClient(new TestWebViewClient(webView.getWebViewClient()) {
+        webView.setWebViewClient(new TestWebViewClient(
+                WebViewClassic.fromWebView(webView).getWebViewClient()) {
 
             /**
              * Bypasses and logs errors.
@@ -217,6 +230,16 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
             }
 
             /**
+             * Ignores and logs SSL client certificate requests.
+             */
+            @Override
+            public void onReceivedClientCertRequest(WebView view, ClientCertRequestHandler handler,
+                    String host_and_port) {
+                Log.w(TAG, "SSL client certificate request: " + host_and_port);
+                handler.cancel();
+            }
+
+            /**
              * Ignores http auth with dummy username and password
              */
             @Override
@@ -230,6 +253,7 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
              */
             @Override
             public void onPageFinished(WebView view, String url) {
+                super.onPageFinished(view, url);
                 if (!pageLoadFinishCalled) {
                     pageLoadFinishCalled = true;
                     if (pageProgressFull) {
@@ -280,7 +304,7 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
             // try to stop page load
             mInst.runOnMainSync(new Runnable(){
                 public void run() {
-                    mActivity.getTabControl().getCurrentTab().getWebView().stopLoading();
+                    mController.getTabControl().getCurrentTab().getWebView().stopLoading();
                 }
             });
             // try to wait for count down latch again
@@ -297,12 +321,14 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
         private int page;
         private String url;
         private boolean isRecovery;
+        private boolean allClear;
 
-        private RunStatus(String file) throws IOException {
-            mFile = new File(file);
+        private RunStatus(File file) throws IOException {
+            mFile = file;
             FileReader input = null;
             BufferedReader reader = null;
             isRecovery = false;
+            allClear = false;
             iteration = 0;
             page = 0;
             try {
@@ -340,7 +366,7 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
         }
 
         public static RunStatus load(String file) throws IOException {
-            return new RunStatus(sExternalStorage + File.separator + file);
+            return new RunStatus(new File(sExternalStorage, file));
         }
 
         public void write() throws IOException {
@@ -361,7 +387,9 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
         }
 
         public void cleanUp() {
-            if (mFile.exists()) {
+            // only perform cleanup when allClear flag is set
+            // i.e. when the test was not interrupted by a Java crash
+            if (mFile.exists() && allClear) {
                 mFile.delete();
             }
         }
@@ -372,6 +400,7 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
 
         public void incrementPage() {
             ++page;
+            allClear = true;
         }
 
         public void incrementIteration() {
@@ -392,6 +421,7 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
 
         public void setUrl(String url) {
             this.url = url;
+            allClear = false;
         }
     }
 
@@ -408,14 +438,16 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
     void loopUrls(BufferedReader input, OutputStreamWriter writer,
             boolean clearCache, int loopCount)
             throws IOException, InterruptedException {
-        Tab tab = mActivity.getTabControl().getCurrentTab();
+        Tab tab = mController.getTabControl().getCurrentTab();
         WebView webView = tab.getWebView();
 
         List<String> pages = new LinkedList<String>();
 
         String page;
         while (null != (page = input.readLine())) {
-            pages.add(page);
+            if (!TextUtils.isEmpty(page)) {
+                pages.add(page);
+            }
         }
 
         Iterator<String> iterator = pages.iterator();
@@ -430,7 +462,7 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
 
         while (mStatus.getIteration() < loopCount) {
             if (clearCache) {
-                webView.clearCache(true);
+                clearCacheUiThread(webView, true);
             }
             while(iterator.hasNext()) {
                 page = iterator.next();
@@ -439,6 +471,8 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
                 Log.i(TAG, "start: " + page);
                 Uri uri = Uri.parse(page);
                 final Intent intent = new Intent(Intent.ACTION_VIEW, uri);
+                intent.putExtra(Browser.EXTRA_APPLICATION_ID,
+                    getInstrumentation().getTargetContext().getPackageName());
 
                 long startTime = System.currentTimeMillis();
                 resetForNewPage();
@@ -452,7 +486,7 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
                 waitForLoad();
                 long stopTime = System.currentTimeMillis();
 
-                String url = webView.getUrl();
+                String url = getUrlUiThread(webView);
                 Log.i(TAG, "finish: " + url);
 
                 if (writer != null) {
@@ -504,6 +538,46 @@ public class PopularUrlsTest extends ActivityInstrumentationTestCase2<BrowserAct
             if (bufferedReader != null) {
                 bufferedReader.close();
             }
+        }
+    }
+
+    private void clearCacheUiThread(final WebView webView, final boolean includeDiskFiles) {
+        Runnable runner = new Runnable() {
+
+            @Override
+            public void run() {
+                webView.clearCache(includeDiskFiles);
+            }
+        };
+        getInstrumentation().runOnMainSync(runner);
+    }
+
+    private String getUrlUiThread(final WebView webView) {
+        WebViewUrlGetter urlGetter = new WebViewUrlGetter(webView);
+        getInstrumentation().runOnMainSync(urlGetter);
+        return urlGetter.getUrl();
+    }
+
+    private class WebViewUrlGetter implements Runnable {
+
+        private WebView mWebView;
+        private String mUrl;
+
+        public WebViewUrlGetter(WebView webView) {
+            mWebView = webView;
+        }
+
+        @Override
+        public void run() {
+                mUrl = null;
+                mUrl = mWebView.getUrl();
+        }
+
+        public String getUrl() {
+            if (mUrl != null) {
+                return mUrl;
+            } else
+                throw new IllegalStateException("url has not been fetched yet");
         }
     }
 }

@@ -84,7 +84,9 @@ abstract class TestWebChromeClient extends WebChromeClient {
     @Override
     public boolean onCreateWindow(WebView view, boolean dialog,
             boolean userGesture, Message resultMsg) {
-        return mWrappedClient.onCreateWindow(view, dialog, userGesture, resultMsg);
+        // do not open any new pop-ups
+        resultMsg.sendToTarget();
+        return true;
     }
 
     /** {@inheritDoc} */
@@ -195,7 +197,7 @@ abstract class TestWebChromeClient extends WebChromeClient {
 
     /** {@inheritDoc} */
     @Override
-    public void openFileChooser(ValueCallback<Uri> uploadFile) {
-        mWrappedClient.openFileChooser(uploadFile);
+    public void openFileChooser(ValueCallback<Uri> uploadFile, String acceptType, String capture) {
+        mWrappedClient.openFileChooser(uploadFile, acceptType, capture);
     }
 }

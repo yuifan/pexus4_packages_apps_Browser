@@ -17,8 +17,11 @@ package com.android.browser.search;
 
 import android.content.Context;
 import android.content.res.Resources;
+import android.content.res.Resources.NotFoundException;
 import android.text.TextUtils;
 import android.util.Log;
+
+import com.android.browser.R;
 
 import java.net.URLEncoder;
 import java.util.Arrays;
@@ -58,9 +61,13 @@ public class SearchEngineInfo {
      */
     public SearchEngineInfo(Context context, String name) throws IllegalArgumentException {
         mName = name;
-
         Resources res = context.getResources();
-        int id_data = res.getIdentifier(name, "array", context.getPackageName());
+
+        String packageName = R.class.getPackage().getName();
+        int id_data = res.getIdentifier(name, "array", packageName);
+        if (id_data == 0) {
+            throw new IllegalArgumentException("No resources found for " + name);
+        }
         mSearchEngineData = res.getStringArray(id_data);
 
         if (mSearchEngineData == null) {

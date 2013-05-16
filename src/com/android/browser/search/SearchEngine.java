@@ -58,7 +58,7 @@ public interface SearchEngine {
     public void close();
 
     /**
-     * Checks whether this search engine supports voice search.
+     * Checks whether this search engine should be sent zero char query.
      */
-    public boolean supportsVoiceSearch();
+    public boolean wantsEmptyQuery();
 }

@@ -195,10 +195,6 @@ public class OpenSearchSearchEngine implements SearchEngine {
         mHttpClient.close();
     }
 
-    public boolean supportsVoiceSearch() {
-        return getName().equals(SearchEngine.GOOGLE);
-    }
-
     private boolean isNetworkConnected(Context context) {
         NetworkInfo networkInfo = getActiveNetworkInfo(context);
         return networkInfo != null && networkInfo.isConnected();
@@ -293,6 +289,11 @@ public class OpenSearchSearchEngine implements SearchEngine {
     @Override
     public String toString() {
         return "OpenSearchSearchEngine{" + mSearchEngineInfo + "}";
+    }
+
+    @Override
+    public boolean wantsEmptyQuery() {
+        return false;
     }
 
 }
